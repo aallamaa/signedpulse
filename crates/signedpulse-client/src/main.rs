@@ -103,12 +103,6 @@ async fn main() -> anyhow::Result<()> {
 
 fn status(config_path: &std::path::Path) -> anyhow::Result<()> {
     let config = ClientConfig::load(config_path)?;
-    let state_path = config
-        .client
-        .state_file
-        .clone()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| status::default_state_path("client"));
 
     let (svc_state, svc_how) =
         service::query_service("signedpulse-client", "com.signedpulse.client");
@@ -124,7 +118,7 @@ fn status(config_path: &std::path::Path) -> anyhow::Result<()> {
     );
 
     let snapshot: Option<ClientStatusSnapshot> =
-        status::refresh_and_read(&state_path, &status::pid_path(&state_path));
+        status::refresh_and_read_component("client", config.client.state_file.as_deref());
     match snapshot {
         None => {
             println!(
@@ -316,9 +310,23 @@ fn generate_key() {
 }
 
 fn init_logging() {
+    use std::io::IsTerminal;
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).with_target(false).init();
+    // Only colorize on a real terminal. Under systemd/journald (or any redirect)
+    // stderr is not a TTY, so ANSI codes would otherwise land as `#033[..m`
+    // garbage in the journal/syslog. There, also drop our timestamp since the
+    // log daemon already stamps every line.
+    let ansi = std::io::stderr().is_terminal();
+    let builder = fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_ansi(ansi);
+    if ansi {
+        builder.init();
+    } else {
+        builder.without_time().init();
+    }
 }
 
 #[cfg(test)]

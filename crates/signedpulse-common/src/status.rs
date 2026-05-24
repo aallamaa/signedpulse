@@ -83,6 +83,32 @@ pub fn pid_path(state_path: &Path) -> PathBuf {
     state_path.with_extension("pid")
 }
 
+/// Candidate default state-file locations to probe when no `state_file` is
+/// configured. The daemon writes to exactly one of these (whichever
+/// `default_state_path` resolves to in *its* environment), but the `status`
+/// command may run in a different environment — e.g. an interactive root shell
+/// has `XDG_RUNTIME_DIR=/run/user/0` while the systemd system service has none
+/// and writes to `/run`. Probing all of them makes `status` robust to that
+/// mismatch. Order: the caller's `$XDG_RUNTIME_DIR`, then `/run`, then the root
+/// login runtime dir; de-duplicated.
+pub fn state_path_candidates(component: &str) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut add = |dir: PathBuf| {
+        let p = dir
+            .join("signedpulse")
+            .join(format!("{component}.state.json"));
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    if let Some(x) = std::env::var_os("XDG_RUNTIME_DIR") {
+        add(PathBuf::from(x));
+    }
+    add(PathBuf::from("/run"));
+    add(PathBuf::from("/run/user/0"));
+    out
+}
+
 /// Create `path` for writing with owner-only (`0600`) permissions set at
 /// creation time and without following a symlink at the final component (unix).
 /// `exclusive` uses `O_EXCL` (fails if it already exists) for temp files.
@@ -269,6 +295,27 @@ pub fn refresh_and_read<T: DeserializeOwned>(state_path: &Path, pid_path: &Path)
     read_snapshot(state_path)
 }
 
+/// Resolve the state path for a component and drive a status refresh. When
+/// `configured` is set, only that path is used (both daemon and `status` honor
+/// the same explicit `state_file`). Otherwise each default candidate location is
+/// probed until one yields a live snapshot — handling the case where the daemon
+/// and `status` resolved different default paths from their environments.
+pub fn refresh_and_read_component<T: DeserializeOwned>(
+    component: &str,
+    configured: Option<&str>,
+) -> Option<T> {
+    let paths = match configured {
+        Some(p) => vec![PathBuf::from(p)],
+        None => state_path_candidates(component),
+    };
+    for sp in paths {
+        if let Some(snap) = refresh_and_read::<T>(&sp, &pid_path(&sp)) {
+            return Some(snap);
+        }
+    }
+    None
+}
+
 fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
@@ -340,6 +387,26 @@ mod tests {
             default_state_path("client"),
             PathBuf::from("/run/signedpulse/client.state.json")
         );
+        match prev {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+    }
+
+    #[test]
+    fn state_path_candidates_include_run_even_when_xdg_is_set() {
+        let prev = std::env::var_os("XDG_RUNTIME_DIR");
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/0");
+        let c = state_path_candidates("server");
+        // The XDG path is tried first, but /run must also be probed so `status`
+        // finds a system-service daemon that wrote there (the reported bug).
+        assert_eq!(
+            c[0],
+            PathBuf::from("/run/user/0/signedpulse/server.state.json")
+        );
+        assert!(c.contains(&PathBuf::from("/run/signedpulse/server.state.json")));
+        // No duplicate when XDG already equals /run/user/0.
+        assert_eq!(c.iter().filter(|p| p.starts_with("/run/user/0")).count(), 1);
         match prev {
             Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
             None => std::env::remove_var("XDG_RUNTIME_DIR"),

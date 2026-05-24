@@ -106,7 +106,7 @@ short timeout or a periodic reconciler if you want it to auto-close.
      |<----------------------------------------|
      |                                         |
   build canonical payload, sign with Ed25519   |
-  (optionally generate + seal a parameter)      |
+  (optionally generate + seal a parameter)     |
      |  RESPONSE {client_id, nonce, [param],   |
      |            signature}                   |
      |---------------------------------------->|  verify: client known? nonce valid,
@@ -324,8 +324,13 @@ sudo signedpulse-server init
 sudo signedpulse-server install-service
 ```
 
-`init` prints the line to run on each client, including `--server-key <PUBLIC>`.
-Edit `/etc/signedpulse/server.toml` to point `command.argv` at your hook program.
+`init` prints the exact line to run on each client, including the
+`--server-key <PUBLIC>` value. It also fills in `--server <HOST>` for you: if you
+bound to a concrete address it uses that, otherwise it auto-detects this host's
+IP from the default route (the source address the kernel would use for outbound
+traffic). On a NAT'd box that is the private IP, so replace it with the
+public/reachable address if clients reach you differently. Edit
+`/etc/signedpulse/server.toml` to point `command.argv` at your hook program.
 
 ### 2. On the client
 

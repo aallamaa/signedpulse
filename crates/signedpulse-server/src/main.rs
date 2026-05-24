@@ -98,12 +98,6 @@ async fn main() -> anyhow::Result<()> {
 
 fn status(config_path: &Path) -> anyhow::Result<()> {
     let config = ServerConfig::load(config_path)?;
-    let state_path = config
-        .server
-        .state_file
-        .clone()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| status::default_state_path("server"));
 
     let (svc_state, svc_how) =
         service::query_service("signedpulse-server", "com.signedpulse.server");
@@ -117,7 +111,7 @@ fn status(config_path: &Path) -> anyhow::Result<()> {
     );
 
     let snapshot: Option<ServerStatusSnapshot> =
-        status::refresh_and_read(&state_path, &status::pid_path(&state_path));
+        status::refresh_and_read_component("server", config.server.state_file.as_deref());
     match snapshot {
         None => {
             println!(
@@ -297,12 +291,74 @@ fn init(args: InitArgs, config_path: &Path) -> anyhow::Result<()> {
     );
     println!();
     println!("=== Give this encryption public key to clients ===");
-    println!("  signedpulse-client init --server <HOST> --server-key \"{enc_public_b64}\"");
+    let host = suggest_host(&args.bind);
+    println!("  signedpulse-client init --server {host} --server-key \"{enc_public_b64}\"");
+    if host == "<HOST>" {
+        println!("  (replace <HOST> with this server's address reachable by clients)");
+    } else {
+        println!("  (auto-detected {host}; replace it if clients reach this host differently)");
+    }
     println!();
     println!(
         "Next: authorize clients with `signedpulse-server add-client`, then start the server."
     );
     Ok(())
+}
+
+/// Default UDP port (kept in sync with the client's `DEFAULT_PORT`); omitted from
+/// the suggested `--server` value since the client fills it in.
+const DEFAULT_PORT: u16 = 7370;
+
+/// Suggest the `--server <HOST>` value to print after `init`. If the operator
+/// bound to a concrete address, that is the host. If they bound to all
+/// interfaces (`0.0.0.0`/`::`), discover the source IP of the default route.
+/// Falls back to the literal `<HOST>` placeholder when nothing can be inferred.
+fn suggest_host(bind: &str) -> String {
+    if let Ok(sa) = bind.parse::<std::net::SocketAddr>() {
+        if !sa.ip().is_unspecified() {
+            return host_with_port(sa.ip(), sa.port());
+        }
+        if let Some(ip) = discover_outbound_ip() {
+            return host_with_port(ip, sa.port());
+        }
+    }
+    "<HOST>".to_string()
+}
+
+/// Render `ip[:port]` for display, omitting the port when it is the client's
+/// default. IPv6 with a non-default port is bracketed (`[ip]:port`).
+fn host_with_port(ip: std::net::IpAddr, port: u16) -> String {
+    if port == DEFAULT_PORT {
+        ip.to_string()
+    } else if ip.is_ipv6() {
+        format!("[{ip}]:{port}")
+    } else {
+        format!("{ip}:{port}")
+    }
+}
+
+/// Best-effort discovery of the address a client elsewhere would reach this host
+/// on: the source IP the kernel selects for the default route. A UDP `connect`
+/// sends no packets and needs no reachability — it just resolves the route and
+/// binds the source address — so this works offline as long as a default route
+/// exists. Returns `None` (→ `<HOST>` placeholder) if it can't tell.
+fn discover_outbound_ip() -> Option<std::net::IpAddr> {
+    for (local, target) in [
+        ("0.0.0.0:0", "1.1.1.1:53"),
+        ("[::]:0", "[2606:4700:4700::1111]:53"),
+    ] {
+        if let Ok(sock) = std::net::UdpSocket::bind(local) {
+            if sock.connect(target).is_ok() {
+                if let Ok(addr) = sock.local_addr() {
+                    let ip = addr.ip();
+                    if !ip.is_unspecified() && !ip.is_loopback() {
+                        return Some(ip);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn add_client(args: AddClientArgs, config_path: &Path) -> anyhow::Result<()> {
@@ -405,7 +461,52 @@ fn install_service(args: InstallArgs, config_path: &Path) -> anyhow::Result<()> 
 }
 
 fn init_logging() {
+    use std::io::IsTerminal;
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).with_target(false).init();
+    // Only colorize on a real terminal. Under systemd/journald (or any redirect)
+    // stderr is not a TTY, so ANSI codes would otherwise land as `#033[..m`
+    // garbage in the journal/syslog. There, also drop our timestamp since the
+    // log daemon already stamps every line.
+    let ansi = std::io::stderr().is_terminal();
+    let builder = fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_ansi(ansi);
+    if ansi {
+        builder.init();
+    } else {
+        builder.without_time().init();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn host_with_port_omits_default_port() {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5));
+        assert_eq!(host_with_port(ip, DEFAULT_PORT), "203.0.113.5");
+        assert_eq!(host_with_port(ip, 9999), "203.0.113.5:9999");
+    }
+
+    #[test]
+    fn host_with_port_brackets_ipv6_with_nondefault_port() {
+        let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        assert_eq!(host_with_port(ip, DEFAULT_PORT), "2001:db8::1");
+        assert_eq!(host_with_port(ip, 9999), "[2001:db8::1]:9999");
+    }
+
+    #[test]
+    fn suggest_host_prefers_a_concrete_bind_address() {
+        assert_eq!(suggest_host("203.0.113.5:7370"), "203.0.113.5");
+        assert_eq!(suggest_host("203.0.113.5:8443"), "203.0.113.5:8443");
+    }
+
+    #[test]
+    fn suggest_host_falls_back_when_bind_is_unparseable() {
+        assert_eq!(suggest_host("not-an-addr"), "<HOST>");
+    }
 }
