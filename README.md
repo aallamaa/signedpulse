@@ -150,7 +150,7 @@ hello_nonce=<base64_nonce>
 Packets use a compact hand-rolled **binary** framing. In cleartext form a packet
 is `header(2) || body`, where the 16-bit header packs a magic byte, a 4-bit
 version and a 4-bit packet type; `client_id` is a 256-bit (32-byte) value. A
-HELLO is ~122 bytes (vs ~300+ for the old JSON).
+HELLO is ~122 bytes on the wire.
 
 With `wire_encryption` (default `required`), the datagram on the wire is instead
 a **bare opaque sealed blob** — no header, no magic — so the protocol is
@@ -511,6 +511,55 @@ server_encryption_key = "BASE64_X25519_SERVER_PUBLIC"
 # param_command_timeout_seconds = 5
 # param_max_len = 256
 ```
+
+### Pulsing multiple servers
+
+One client can pulse several servers at once. `[client]` is the primary server;
+add a `[client.servers.<name>]` table for each additional one. The table key is a
+**local label** (used for status and uniqueness), *not* the wire `server_id`.
+
+Each server signs its payloads with a `server_id` that **must match that remote
+server's configured `server_id`** — otherwise every HELLO is rejected as an
+invalid signature. That `server_id` defaults to the label, so you only set it
+explicitly when they differ (e.g. two servers that both kept the default
+`signedpulse-main`). Every target reuses the shared identity (`client_id` /
+`private_key`) but runs its own independent pulse loop, inherits any omitted field
+from `[client]`, and has its **own** X25519 key (`server_encryption_key` is never
+inherited).
+
+```toml
+[client]
+client_id = "9819…f8"
+server_addr = "203.0.113.10:7370"
+server_id = "signedpulse-main"
+private_key = "BASE64_ED25519_PRIVATE_KEY"
+server_encryption_key = "BASE64_X25519_MAIN_PUBLIC"
+interval_seconds = 300
+
+[client.servers.backup]                 # "backup" is just a local label
+server_addr = "203.0.113.20:7370"
+server_id = "signedpulse-main"          # set this to the REMOTE server's server_id
+server_encryption_key = "BASE64_X25519_BACKUP_PUBLIC"
+interval_seconds = 600                  # optional; else inherits [client]
+```
+
+Rather than editing the file by hand, add a server (same address flags as `init`):
+
+```sh
+sudo signedpulse-client add-server --name backup --server 203.0.113.20 \
+    --server-key "BASE64_X25519_BACKUP_PUBLIC" \
+    --server-id signedpulse-main \      # the remote's server_id; omit if it equals --name
+    --interval 600                      # optional; --no-encryption for cleartext
+```
+
+It validates the inputs, rejects a duplicate or primary-colliding label, appends
+the `[client.servers.<name>]` block, rewrites the config atomically at `0600`, and
+prints the exact `signedpulse-server add-client …` line (with this client's public
+key) to run on the new server.
+
+Authorize the **same** client public key on each server (or use separate client
+identities/configs if you prefer per-server key isolation), then restart the
+client. `signedpulse-client status` reports each server separately by label.
 
 ### Passing a client-generated parameter
 

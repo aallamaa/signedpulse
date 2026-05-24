@@ -1,6 +1,7 @@
 //! TOML configuration structures for the server and client, with sane defaults.
 
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use zeroize::Zeroize;
@@ -345,6 +346,58 @@ pub struct ClientSection {
     /// `wire_encryption` setting.
     #[serde(default = "default_true")]
     pub wire_encryption: bool,
+    /// Additional servers to pulse, configured as `[client.servers.<name>]`
+    /// tables. The table key is a *local label* used for status and uniqueness,
+    /// not necessarily the wire `server_id` (see [`ServerOverride::server_id`]).
+    /// The `[client]` block above is the primary server; each entry here adds
+    /// another independent pulse loop that reuses the shared identity
+    /// (`client_id`/`private_key`) but targets its own address and key. Unset
+    /// fields inherit from `[client]`.
+    #[serde(default)]
+    pub servers: BTreeMap<String, ServerOverride>,
+}
+
+/// A secondary server target (`[client.servers.<name>]`). The table key is a
+/// local label; only `server_addr` is required, and every other field falls back
+/// to the corresponding `[client]` value when omitted. Each server has its own
+/// X25519 key, so `server_encryption_key` is never inherited — an encrypted
+/// entry must supply its own.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerOverride {
+    /// Server UDP address, e.g. "203.0.113.11:7370".
+    pub server_addr: String,
+    /// The `server_id` signed into this server's payloads — it **must match the
+    /// remote server's** configured `server_id`, or every HELLO is rejected as an
+    /// invalid signature. Defaults to the table key (the local label) when unset,
+    /// so set it explicitly only when the label differs from the remote id (e.g.
+    /// two servers that both use the default `signedpulse-main`).
+    #[serde(default)]
+    pub server_id: Option<String>,
+    /// This server's base64 X25519 public key (not inherited from `[client]`).
+    #[serde(default)]
+    pub server_encryption_key: Option<String>,
+    /// Override `[client].wire_encryption` for this server.
+    #[serde(default)]
+    pub wire_encryption: Option<bool>,
+    /// Override `[client].interval_seconds` for this server.
+    #[serde(default)]
+    pub interval_seconds: Option<u64>,
+    /// Override `[client].challenge_timeout_seconds` for this server.
+    #[serde(default)]
+    pub challenge_timeout_seconds: Option<u64>,
+    /// Override `[client].retries` for this server.
+    #[serde(default)]
+    pub retries: Option<u32>,
+    /// Override `[client].param_command` for this server.
+    #[serde(default)]
+    pub param_command: Option<Vec<String>>,
+    /// Override `[client].param_command_timeout_seconds` for this server.
+    #[serde(default)]
+    pub param_command_timeout_seconds: Option<u64>,
+    /// Override `[client].param_max_len` for this server.
+    #[serde(default)]
+    pub param_max_len: Option<usize>,
 }
 
 fn default_true() -> bool {
@@ -413,6 +466,62 @@ impl ClientConfig {
             return Err(ConfigError::Invalid(
                 "client.param_max_len must be between 1 and 60000".into(),
             ));
+        }
+        // Validate each additional server target. The map key is its server_id.
+        for (server_id, ov) in &cfg.client.servers {
+            if server_id.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "client.servers entries must have a non-empty server_id (the table key)".into(),
+                ));
+            }
+            if *server_id == cfg.client.server_id {
+                return Err(ConfigError::Invalid(format!(
+                    "client.servers.{server_id} duplicates the primary [client] server_id"
+                )));
+            }
+            if ov.server_addr.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "client.servers.{server_id}.server_addr must not be empty"
+                )));
+            }
+            // Effective settings inherit from [client] when not overridden.
+            let wire = ov.wire_encryption.unwrap_or(cfg.client.wire_encryption);
+            let has_param = ov
+                .param_command
+                .as_ref()
+                .or(cfg.client.param_command.as_ref())
+                .is_some();
+            // Each server has its own key; it is never inherited from [client].
+            if (wire || has_param) && ov.server_encryption_key.is_none() {
+                return Err(ConfigError::Invalid(format!(
+                    "client.servers.{server_id}.server_encryption_key is required when its \
+                     wire_encryption is true or a param_command applies"
+                )));
+            }
+            if let Some(argv) = &ov.param_command {
+                if argv.is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "client.servers.{server_id}.param_command must not be an empty array"
+                    )));
+                }
+            }
+            if ov.interval_seconds == Some(0) {
+                return Err(ConfigError::Invalid(format!(
+                    "client.servers.{server_id}.interval_seconds must be >= 1"
+                )));
+            }
+            if ov.challenge_timeout_seconds == Some(0) {
+                return Err(ConfigError::Invalid(format!(
+                    "client.servers.{server_id}.challenge_timeout_seconds must be >= 1"
+                )));
+            }
+            if let Some(n) = ov.param_max_len {
+                if n == 0 || n > 60_000 {
+                    return Err(ConfigError::Invalid(format!(
+                        "client.servers.{server_id}.param_max_len must be between 1 and 60000"
+                    )));
+                }
+            }
         }
         Ok(cfg)
     }
@@ -639,6 +748,110 @@ mod tests {
         );
         let t = write_temp(&toml);
         // wire_encryption defaults true → server_encryption_key required.
+        assert!(matches!(
+            ClientConfig::load(t.path()),
+            Err(ConfigError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn client_config_parses_multiple_servers() {
+        let toml = format!(
+            r#"
+            [client]
+            client_id = "{HEX_ID2}"
+            server_addr = "127.0.0.1:7370"
+            server_id = "sp-A"
+            private_key = "AAAA"
+            wire_encryption = false
+
+            [client.servers.sp-B]
+            server_addr = "10.0.0.2:7370"
+            wire_encryption = false
+
+            [client.servers.sp-C]
+            server_addr = "10.0.0.3:9999"
+            interval_seconds = 60
+            wire_encryption = false
+        "#
+        );
+        let t = write_temp(&toml);
+        let cfg = ClientConfig::load(t.path()).unwrap();
+        assert_eq!(cfg.client.servers.len(), 2);
+        assert_eq!(cfg.client.servers["sp-B"].server_addr, "10.0.0.2:7370");
+        assert_eq!(cfg.client.servers["sp-C"].interval_seconds, Some(60));
+    }
+
+    #[test]
+    fn client_config_allows_shared_wire_server_id_via_distinct_labels() {
+        // Two servers that both use server_id "sp-A": the primary, and a labeled
+        // secondary that sets server_id explicitly. Distinct labels keep them
+        // unambiguous even though the wire server_id is the same.
+        let toml = format!(
+            r#"
+            [client]
+            client_id = "{HEX_ID2}"
+            server_addr = "127.0.0.1:7370"
+            server_id = "sp-A"
+            private_key = "AAAA"
+            wire_encryption = false
+
+            [client.servers.velizy1]
+            server_addr = "10.0.0.2:7370"
+            server_id = "sp-A"
+            wire_encryption = false
+        "#
+        );
+        let t = write_temp(&toml);
+        let cfg = ClientConfig::load(t.path()).unwrap();
+        assert_eq!(
+            cfg.client.servers["velizy1"].server_id.as_deref(),
+            Some("sp-A")
+        );
+    }
+
+    #[test]
+    fn client_config_rejects_secondary_server_id_colliding_with_primary() {
+        let toml = format!(
+            r#"
+            [client]
+            client_id = "{HEX_ID2}"
+            server_addr = "127.0.0.1:7370"
+            server_id = "sp-A"
+            private_key = "AAAA"
+            wire_encryption = false
+
+            [client.servers.sp-A]
+            server_addr = "10.0.0.2:7370"
+            wire_encryption = false
+        "#
+        );
+        let t = write_temp(&toml);
+        assert!(matches!(
+            ClientConfig::load(t.path()),
+            Err(ConfigError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn client_config_secondary_server_requires_its_own_key_when_encrypted() {
+        // Primary is cleartext, but the secondary defaults wire_encryption=true
+        // (inherited) and provides no key of its own → rejected.
+        let toml = format!(
+            r#"
+            [client]
+            client_id = "{HEX_ID2}"
+            server_addr = "127.0.0.1:7370"
+            server_id = "sp-A"
+            private_key = "AAAA"
+            wire_encryption = false
+
+            [client.servers.sp-B]
+            server_addr = "10.0.0.2:7370"
+            wire_encryption = true
+        "#
+        );
+        let t = write_temp(&toml);
         assert!(matches!(
             ClientConfig::load(t.path()),
             Err(ConfigError::Invalid(_))

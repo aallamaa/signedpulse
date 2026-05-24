@@ -290,14 +290,28 @@ fn init(args: InitArgs, config_path: &Path) -> anyhow::Result<()> {
         config_path.display()
     );
     println!();
-    println!("=== Give this encryption public key to clients ===");
+    println!("=== Set up clients to pulse this server ===");
     let host = suggest_host(&args.bind);
-    println!("  signedpulse-client init --server {host} --server-key \"{enc_public_b64}\"");
     if host == "<HOST>" {
-        println!("  (replace <HOST> with this server's address reachable by clients)");
+        println!("(replace <HOST> below with this server's address reachable by clients)");
     } else {
-        println!("  (auto-detected {host}; replace it if clients reach this host differently)");
+        println!(
+            "(auto-detected address {host}; replace it if clients reach this host differently)"
+        );
     }
+    let server_id = &args.server_id;
+    println!();
+    println!("For a NEW client:");
+    println!(
+        "  signedpulse-client init --server {host} --server-id \"{server_id}\" \
+         --server-key \"{enc_public_b64}\""
+    );
+    println!();
+    println!("To ADD this server to an EXISTING client (pick a unique local --name):");
+    println!(
+        "  signedpulse-client add-server --name \"{server_id}\" --server {host} \
+         --server-id \"{server_id}\" --server-key \"{enc_public_b64}\""
+    );
     println!();
     println!(
         "Next: authorize clients with `signedpulse-server add-client`, then start the server."

@@ -53,12 +53,23 @@ pub struct ServerStatusSnapshot {
     pub clients: BTreeMap<String, PulseInfo>,
 }
 
-/// Point-in-time view of the client, written on demand.
+/// Point-in-time view of the client, written on demand. A client may pulse
+/// several servers; each gets its own [`ServerLegStatus`] keyed by `server_id`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientStatusSnapshot {
     pub started_at_unix: i64,
     pub pid: u32,
+    /// Per-server pulse status, keyed by `server_id`.
+    pub servers: BTreeMap<String, ServerLegStatus>,
+}
+
+/// Status of one server the client pulses.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerLegStatus {
     pub server_addr: String,
+    /// The wire `server_id` signed for this server (may differ from the label).
+    #[serde(default)]
+    pub server_id: String,
     pub interval_seconds: u64,
     pub last_attempt_at_unix: Option<i64>,
     pub last_success_at_unix: Option<i64>,

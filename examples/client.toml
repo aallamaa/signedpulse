@@ -29,3 +29,19 @@ server_encryption_key = "REPLACE_WITH_BASE64_X25519_SERVER_PUBLIC"
 
 # Optional: where `signedpulse-client status` reads live state (see README).
 # state_file = "/run/signedpulse/client.state.json"
+
+# Optional: pulse additional servers from this one client. The table key is a
+# LOCAL LABEL (for status/uniqueness), not the wire server_id. Each block adds an
+# independent pulse loop sharing the identity above (client_id/private_key). Only
+# server_addr is required; omitted fields inherit from [client]. Each server has
+# its OWN X25519 key (server_encryption_key is never inherited).
+#
+# server_id MUST match the remote server's configured server_id (it is signed
+# into the payload). It defaults to the label, so set it only when they differ —
+# e.g. when a second server also kept the default "signedpulse-main".
+# [client.servers.backup]
+# server_addr = "203.0.113.20:7370"
+# server_id = "signedpulse-main"    # the REMOTE server's server_id (defaults to the label)
+# server_encryption_key = "REPLACE_WITH_BACKUP_SERVER_X25519_PUBLIC"
+# interval_seconds = 600            # optional override (else inherits [client])
+# wire_encryption = true            # optional override

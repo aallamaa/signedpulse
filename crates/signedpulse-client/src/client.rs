@@ -1,5 +1,12 @@
 //! The client side of the handshake and the periodic run loop.
+//!
+//! A client can pulse several servers at once: `[client]` is the primary server
+//! and each `[client.servers.<server_id>]` adds another. All targets share the
+//! client identity (`client_id`/signing key) but run independent pulse loops,
+//! each with its own address, server key, and timing. Their live status is
+//! collected per-`server_id` into one [`ClientStatusSnapshot`].
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -8,12 +15,12 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use ed25519_dalek::SigningKey;
-use signedpulse_common::config::ClientConfig;
+use signedpulse_common::config::{ClientConfig, ClientSection, ServerOverride};
 use signedpulse_common::crypto::{self, Nonce, X25519Bytes};
 use signedpulse_common::protocol::{
     hello_signing_payload, response_signing_payload, ClientId, Hello, Packet, Response,
 };
-use signedpulse_common::status::{self, ClientStatusSnapshot};
+use signedpulse_common::status::{self, ClientStatusSnapshot, ServerLegStatus};
 use tokio::net::UdpSocket;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
@@ -52,52 +59,94 @@ impl DumpListener {
     }
 }
 
-/// Holds the resolved client configuration and the loaded keys.
+/// One fully-resolved server target the client pulses. Built from `[client]`
+/// (primary) and each `[client.servers.<name>]` entry, with inheritance applied.
+#[derive(Clone)]
+struct ServerTarget {
+    /// Local label (status key / config table key). Unique within this client.
+    name: String,
+    /// The id signed into the payload; must match the remote server's server_id.
+    server_id: String,
+    server_addr: String,
+    /// Server X25519 public key for wire/param encryption, if configured.
+    server_pub: Option<X25519Bytes>,
+    wire_encryption: bool,
+    interval: Duration,
+    challenge_timeout: Duration,
+    retries: u32,
+    param_command: Option<Vec<String>>,
+    param_command_timeout: Duration,
+    param_max_len: usize,
+}
+
+/// Holds the shared client identity and the resolved set of server targets.
 pub struct Client {
-    config: ClientConfig,
     signing_key: SigningKey,
     client_id: ClientId,
-    /// Server X25519 public key (for wire and param encryption), if configured.
-    server_pub: Option<X25519Bytes>,
+    targets: Vec<ServerTarget>,
     status: Arc<Mutex<ClientStatusSnapshot>>,
     state_path: PathBuf,
 }
 
 impl Client {
     pub fn from_config(config: ClientConfig) -> anyhow::Result<Self> {
-        let signing_key = crypto::load_signing_key(&config.client.private_key)
+        let c = &config.client;
+        let signing_key = crypto::load_signing_key(&c.private_key)
             .map_err(|e| anyhow::anyhow!("invalid private_key in client config: {e}"))?;
-        let client_id = ClientId::from_hex(&config.client.client_id)
+        let client_id = ClientId::from_hex(&c.client_id)
             .map_err(|_| anyhow::anyhow!("client.client_id must be 64 hex characters"))?;
-        let server_pub = match &config.client.server_encryption_key {
-            Some(b64) => Some(
-                crypto::x25519_from_base64(b64)
-                    .map_err(|e| anyhow::anyhow!("invalid server_encryption_key: {e}"))?,
-            ),
-            None => None,
-        };
-        if config.client.wire_encryption && server_pub.is_none() {
-            anyhow::bail!("wire_encryption is on but server_encryption_key is missing");
+
+        // The primary server comes from the [client] fields directly; its local
+        // label is its server_id.
+        let mut targets = vec![resolve_target(
+            c.server_id.clone(),
+            c.server_id.clone(),
+            &c.server_addr,
+            c.server_encryption_key.as_deref(),
+            c.wire_encryption,
+            c.interval_seconds,
+            c.challenge_timeout_seconds,
+            c.retries,
+            c.param_command.clone(),
+            c.param_command_timeout_seconds,
+            c.param_max_len,
+        )?];
+        // Additional servers inherit unset fields from [client]. Their key is the
+        // server_id; each carries its own address and (own, never inherited) key.
+        for (id, ov) in &c.servers {
+            targets.push(resolve_override(id, ov, c)?);
         }
-        let state_path = config
-            .client
+
+        // Seed the per-server status legs, keyed by the local label.
+        let mut legs = BTreeMap::new();
+        for t in &targets {
+            legs.insert(
+                t.name.clone(),
+                ServerLegStatus {
+                    server_addr: t.server_addr.clone(),
+                    server_id: t.server_id.clone(),
+                    interval_seconds: t.interval.as_secs(),
+                    last_result: "pending".to_string(),
+                    ..Default::default()
+                },
+            );
+        }
+        let status = Arc::new(Mutex::new(ClientStatusSnapshot {
+            started_at_unix: now_unix(),
+            pid: std::process::id(),
+            servers: legs,
+        }));
+
+        let state_path = c
             .state_file
             .clone()
             .map(PathBuf::from)
             .unwrap_or_else(|| status::default_state_path("client"));
-        let status = Arc::new(Mutex::new(ClientStatusSnapshot {
-            started_at_unix: now_unix(),
-            pid: std::process::id(),
-            server_addr: config.client.server_addr.clone(),
-            interval_seconds: config.client.interval_seconds,
-            last_result: "pending".to_string(),
-            ..Default::default()
-        }));
+
         Ok(Client {
-            config,
             signing_key,
             client_id,
-            server_pub,
+            targets,
             status,
             state_path,
         })
@@ -111,14 +160,12 @@ impl Client {
         }
     }
 
-    /// Run forever: every `interval_seconds`, perform one handshake cycle.
+    /// Run forever: spawn one pulse loop per server target, then serve on-demand
+    /// status dumps (SIGUSR1) for the life of the process.
     pub async fn run_forever(&self) -> anyhow::Result<()> {
-        let interval = Duration::from_secs(self.config.client.interval_seconds);
         info!(
-            client_id = %self.config.client.client_id,
-            server = %self.config.client.server_addr,
-            interval_s = self.config.client.interval_seconds,
-            wire_encryption = self.config.client.wire_encryption,
+            client_id = %self.client_id.to_hex(),
+            servers = self.targets.len(),
             "signedpulse client started"
         );
 
@@ -128,70 +175,177 @@ impl Client {
         }
         let mut dump = DumpListener::new()?;
 
+        for target in &self.targets {
+            let pulser = Pulser {
+                signing_key: self.signing_key.clone(),
+                client_id: self.client_id,
+                target: target.clone(),
+                status: self.status.clone(),
+            };
+            tokio::spawn(async move { pulser.run_loop().await });
+        }
+
+        // The pulse loops run in the background; this task stays alive to answer
+        // status-dump requests promptly.
+        loop {
+            dump.recv().await;
+            self.write_status();
+        }
+    }
+}
+
+/// Build a target from explicit values (used for the primary [client] server).
+#[allow(clippy::too_many_arguments)]
+fn resolve_target(
+    name: String,
+    server_id: String,
+    server_addr: &str,
+    enc_key_b64: Option<&str>,
+    wire_encryption: bool,
+    interval_seconds: u64,
+    challenge_timeout_seconds: u64,
+    retries: u32,
+    param_command: Option<Vec<String>>,
+    param_command_timeout_seconds: u64,
+    param_max_len: usize,
+) -> anyhow::Result<ServerTarget> {
+    let server_pub = match enc_key_b64 {
+        Some(b64) => Some(
+            crypto::x25519_from_base64(b64)
+                .map_err(|e| anyhow::anyhow!("invalid server_encryption_key for {name}: {e}"))?,
+        ),
+        None => None,
+    };
+    if wire_encryption && server_pub.is_none() {
+        anyhow::bail!("server {name}: wire_encryption is on but server_encryption_key is missing");
+    }
+    if param_command.is_some() && server_pub.is_none() {
+        anyhow::bail!("server {name}: param_command requires server_encryption_key");
+    }
+    Ok(ServerTarget {
+        name,
+        server_id,
+        server_addr: server_addr.to_string(),
+        server_pub,
+        wire_encryption,
+        interval: Duration::from_secs(interval_seconds),
+        challenge_timeout: Duration::from_secs(challenge_timeout_seconds),
+        retries,
+        param_command,
+        param_command_timeout: Duration::from_secs(param_command_timeout_seconds),
+        param_max_len,
+    })
+}
+
+/// Build a secondary target, inheriting unset fields from `[client]`. The local
+/// label is the config table key; the wire `server_id` defaults to that label
+/// unless the entry overrides it.
+fn resolve_override(
+    name: &str,
+    ov: &ServerOverride,
+    base: &ClientSection,
+) -> anyhow::Result<ServerTarget> {
+    resolve_target(
+        name.to_string(),
+        ov.server_id.clone().unwrap_or_else(|| name.to_string()),
+        &ov.server_addr,
+        ov.server_encryption_key.as_deref(),
+        ov.wire_encryption.unwrap_or(base.wire_encryption),
+        ov.interval_seconds.unwrap_or(base.interval_seconds),
+        ov.challenge_timeout_seconds
+            .unwrap_or(base.challenge_timeout_seconds),
+        ov.retries.unwrap_or(base.retries),
+        ov.param_command
+            .clone()
+            .or_else(|| base.param_command.clone()),
+        ov.param_command_timeout_seconds
+            .unwrap_or(base.param_command_timeout_seconds),
+        ov.param_max_len.unwrap_or(base.param_max_len),
+    )
+}
+
+/// One server's pulse loop. Owns everything it needs so it can run on its own
+/// task; shares the live status map so its leg is visible to `status`.
+struct Pulser {
+    signing_key: SigningKey,
+    client_id: ClientId,
+    target: ServerTarget,
+    status: Arc<Mutex<ClientStatusSnapshot>>,
+}
+
+impl Pulser {
+    async fn run_loop(self) {
+        info!(
+            server = %self.target.name,
+            server_id = %self.target.server_id,
+            addr = %self.target.server_addr,
+            interval_s = self.target.interval.as_secs(),
+            wire_encryption = self.target.wire_encryption,
+            "pulsing server"
+        );
         loop {
             let now = now_unix();
+            // Record the attempt time up front so a leg that's mid-cycle (a
+            // handshake can take several seconds across retries) shows as active
+            // rather than idle/pending in `status`.
+            if let Some(leg) = self
+                .status
+                .lock()
+                .unwrap()
+                .servers
+                .get_mut(&self.target.name)
+            {
+                leg.last_attempt_at_unix = Some(now);
+            }
             let result = self.run_cycle().await;
             {
                 let mut s = self.status.lock().unwrap();
-                s.last_attempt_at_unix = Some(now);
-                match &result {
-                    Ok(()) => {
-                        s.last_success_at_unix = Some(now);
-                        s.last_result = "ok".to_string();
+                if let Some(leg) = s.servers.get_mut(&self.target.name) {
+                    match &result {
+                        Ok(()) => {
+                            leg.last_success_at_unix = Some(now);
+                            leg.last_result = "ok".to_string();
+                        }
+                        Err(e) => leg.last_result = e.to_string(),
                     }
-                    Err(e) => s.last_result = e.to_string(),
                 }
             }
             if let Err(e) = result {
-                warn!(error = %e, "pulse cycle failed");
+                warn!(server = %self.target.name, error = %e, "pulse cycle failed");
             }
-
-            // Wait for the next interval, but answer status-dump requests promptly.
-            let sleep = tokio::time::sleep(interval);
-            tokio::pin!(sleep);
-            loop {
-                tokio::select! {
-                    _ = &mut sleep => break,
-                    _ = dump.recv() => self.write_status(),
-                }
-            }
+            tokio::time::sleep(self.target.interval).await;
         }
     }
 
     /// One full HELLO → CHALLENGE → RESPONSE exchange, with retries on packet
     /// loss. The parameter is generated once per cycle and reused across retries.
-    pub async fn run_cycle(&self) -> anyhow::Result<()> {
+    async fn run_cycle(&self) -> anyhow::Result<()> {
         let param = self.generate_param().await?;
 
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        socket.connect(&self.config.client.server_addr).await?;
+        socket.connect(&self.target.server_addr).await?;
 
-        let timeout = Duration::from_secs(self.config.client.challenge_timeout_seconds);
-        let retries = self.config.client.retries;
-
-        for attempt in 1..=retries.max(1) {
-            match self.attempt_once(&socket, timeout, param.as_deref()).await {
+        let retries = self.target.retries.max(1);
+        for attempt in 1..=retries {
+            match self.attempt_once(&socket, param.as_deref()).await {
                 Ok(()) => return Ok(()),
-                Err(e) => warn!(attempt, max = retries, error = %e, "handshake attempt failed"),
+                Err(e) => {
+                    warn!(server = %self.target.name, attempt, max = retries, error = %e, "handshake attempt failed")
+                }
             }
         }
-        anyhow::bail!("all {} handshake attempts failed", retries.max(1));
+        anyhow::bail!("all {retries} handshake attempts failed");
     }
 
-    async fn attempt_once(
-        &self,
-        socket: &UdpSocket,
-        timeout: Duration,
-        param: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let encrypt = self.config.client.wire_encryption;
+    async fn attempt_once(&self, socket: &UdpSocket, param: Option<&str>) -> anyhow::Result<()> {
+        let encrypt = self.target.wire_encryption;
         let client_hex = self.client_id.to_hex();
 
         // 1. Build and sign the HELLO (fresh nonce per attempt).
         let timestamp = now_unix();
         let hello_nonce: [u8; 16] = Nonce::generate().0[..16].try_into().unwrap();
         let hello_payload = hello_signing_payload(
-            &self.config.client.server_id,
+            &self.target.server_id,
             &client_hex,
             timestamp,
             &B64.encode(hello_nonce),
@@ -207,11 +361,13 @@ impl Client {
         //    secret so we can open the sealed CHALLENGE reply.
         let (datagram, session_secret) = self.frame_outbound(&hello.encode(), encrypt)?;
         socket.send(&datagram).await?;
-        info!("sent HELLO");
+        info!(server = %self.target.name, "sent HELLO");
 
         // 3. Await CHALLENGE.
         let mut buf = vec![0u8; 2048];
-        let len = match tokio::time::timeout(timeout, socket.recv(&mut buf)).await {
+        let len = match tokio::time::timeout(self.target.challenge_timeout, socket.recv(&mut buf))
+            .await
+        {
             Ok(r) => r?,
             Err(_) => anyhow::bail!("timed out waiting for CHALLENGE"),
         };
@@ -228,7 +384,7 @@ impl Client {
         if challenge.client_id != self.client_id {
             anyhow::bail!("challenge client_id mismatch");
         }
-        info!(expires_at = challenge.expires_at_unix, "received CHALLENGE");
+        info!(server = %self.target.name, expires_at = challenge.expires_at_unix, "received CHALLENGE");
 
         // 4. Seal the optional parameter and build the signed RESPONSE.
         let param_blob = match param {
@@ -240,7 +396,7 @@ impl Client {
             .map(|b| B64.encode(b))
             .unwrap_or_default();
         let payload = response_signing_payload(
-            &self.config.client.server_id,
+            &self.target.server_id,
             &client_hex,
             &B64.encode(challenge.nonce),
             challenge.expires_at_unix,
@@ -256,7 +412,7 @@ impl Client {
         // 5. Send the RESPONSE (sealed if encrypting). No reply expected.
         let (datagram, _) = self.frame_outbound(&response.encode(), encrypt)?;
         socket.send(&datagram).await?;
-        info!("sent RESPONSE");
+        info!(server = %self.target.name, "sent RESPONSE");
         Ok(())
     }
 
@@ -271,6 +427,7 @@ impl Client {
             return Ok((packet_bytes.to_vec(), None));
         }
         let server_pub = self
+            .target
             .server_pub
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("wire encryption requires server_encryption_key"))?;
@@ -295,6 +452,7 @@ impl Client {
         }
         let secret = session_secret.ok_or_else(|| anyhow::anyhow!("missing session secret"))?;
         let server_pub = self
+            .target
             .server_pub
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("wire encryption requires server_encryption_key"))?;
@@ -306,6 +464,7 @@ impl Client {
     /// Seal a parameter plaintext to the server's X25519 key (raw blob bytes).
     fn seal_param(&self, plaintext: &str) -> anyhow::Result<Vec<u8>> {
         let server_pub = self
+            .target
             .server_pub
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("param requires server_encryption_key"))?;
@@ -315,11 +474,10 @@ impl Client {
 
     /// Run the configured `param_command` and return its validated stdout.
     async fn generate_param(&self) -> anyhow::Result<Option<String>> {
-        let argv = match &self.config.client.param_command {
+        let argv = match &self.target.param_command {
             Some(a) => a,
             None => return Ok(None),
         };
-        let timeout = Duration::from_secs(self.config.client.param_command_timeout_seconds);
 
         let mut cmd = tokio::process::Command::new(&argv[0]);
         cmd.args(&argv[1..])
@@ -330,10 +488,13 @@ impl Client {
             .spawn()
             .map_err(|e| anyhow::anyhow!("param_command failed to spawn: {e}"))?;
 
-        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(r) => r.map_err(|e| anyhow::anyhow!("param_command error: {e}"))?,
-            Err(_) => anyhow::bail!("param_command timed out"),
-        };
+        let output =
+            match tokio::time::timeout(self.target.param_command_timeout, child.wait_with_output())
+                .await
+            {
+                Ok(r) => r.map_err(|e| anyhow::anyhow!("param_command error: {e}"))?,
+                Err(_) => anyhow::bail!("param_command timed out"),
+            };
         if !output.status.success() {
             anyhow::bail!("param_command exited with {}", output.status);
         }
@@ -341,11 +502,11 @@ impl Client {
         let text = String::from_utf8(output.stdout)
             .map_err(|_| anyhow::anyhow!("param_command output is not UTF-8"))?;
         let trimmed = text.trim();
-        if trimmed.len() > self.config.client.param_max_len {
+        if trimmed.len() > self.target.param_max_len {
             anyhow::bail!(
                 "param ({} bytes) exceeds param_max_len {}",
                 trimmed.len(),
-                self.config.client.param_max_len
+                self.target.param_max_len
             );
         }
         if trimmed.chars().any(|c| c.is_control()) {

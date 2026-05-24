@@ -4,6 +4,8 @@ mod client;
 
 use std::path::PathBuf;
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use clap::{Parser, Subcommand};
 use client::Client;
 use signedpulse_common::config::ClientConfig;
@@ -31,6 +33,8 @@ struct Cli {
 enum Command {
     /// Generate a config and keypair, then print what to add on the server.
     Init(InitArgs),
+    /// Add another server to pulse, appended to an existing client config.
+    AddServer(AddServerArgs),
     /// Generate a new Ed25519 keypair and print the config snippets.
     GenerateKey,
     /// Install (and start) this client as a background service.
@@ -69,6 +73,33 @@ struct InitArgs {
 }
 
 #[derive(clap::Args, Debug)]
+struct AddServerArgs {
+    /// Local label for this server: the `[client.servers.<name>]` key, used for
+    /// status. Must be unique (not the primary's, nor an already-added one).
+    #[arg(long)]
+    name: String,
+    /// Server address, e.g. "203.0.113.20" or "203.0.113.20:7370".
+    #[arg(long)]
+    server: String,
+    /// The new server's base64 X25519 public key (printed by its `init`).
+    /// Required for the default encrypted mode.
+    #[arg(long)]
+    server_key: Option<String>,
+    /// The remote server's server_id (signed into the payload; must match what
+    /// that server is configured with). Defaults to --name when omitted — set it
+    /// only when the label differs from the remote id (e.g. two servers that both
+    /// use the default `signedpulse-main`).
+    #[arg(long)]
+    server_id: Option<String>,
+    /// Override the pulse interval for this server (else inherits `[client]`).
+    #[arg(long)]
+    interval: Option<u64>,
+    /// This server speaks cleartext binary instead of sealed datagrams.
+    #[arg(long)]
+    no_encryption: bool,
+}
+
+#[derive(clap::Args, Debug)]
 struct InstallArgs {
     /// Install a per-user systemd unit instead of a system-wide one (Linux).
     #[arg(long)]
@@ -86,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Command::Init(args)) => init(args, &cli.config),
+        Some(Command::AddServer(args)) => add_server(args, &cli.config),
         Some(Command::GenerateKey) => {
             generate_key();
             Ok(())
@@ -110,11 +142,17 @@ fn status(config_path: &std::path::Path) -> anyhow::Result<()> {
         "service:    {} [{svc_how}]",
         status::service_word(svc_state)
     );
+    let extra = config.client.servers.len();
+    let server_summary = if extra > 0 {
+        format!("{} (+{extra} more)", config.client.server_addr)
+    } else {
+        config.client.server_addr.clone()
+    };
     println!(
         "config:     {}  client_id={}  server={}",
         config_path.display(),
         config.client.client_id,
-        config.client.server_addr
+        server_summary
     );
 
     let snapshot: Option<ClientStatusSnapshot> =
@@ -126,22 +164,39 @@ fn status(config_path: &std::path::Path) -> anyhow::Result<()> {
             );
         }
         Some(s) => {
-            match s.last_success_at_unix {
-                Some(t) => println!("last pulse: OK  {}", status::ago(t)),
-                None => println!("last pulse: none succeeded yet"),
-            }
-            // Next pulse ≈ last attempt + interval.
-            if let Some(attempt) = s.last_attempt_at_unix {
-                let next_in = (attempt as i128 + s.interval_seconds as i128
-                    - status::now_unix() as i128)
-                    .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-                if next_in > 0 {
-                    println!("next pulse: in ~{}", status::duration_words(next_in));
+            println!(
+                "pid:        {}   uptime: {}",
+                s.pid,
+                status::duration_words(status::now_unix().saturating_sub(s.started_at_unix))
+            );
+            // One block per server the client pulses, keyed by its local label.
+            for (name, leg) in &s.servers {
+                if !leg.server_id.is_empty() && leg.server_id != *name {
+                    println!(
+                        "server {name} (server_id={}, {}):",
+                        leg.server_id, leg.server_addr
+                    );
                 } else {
-                    println!("next pulse: due now");
+                    println!("server {name} ({}):", leg.server_addr);
                 }
+                match leg.last_success_at_unix {
+                    Some(t) => println!("  last pulse: OK  {}", status::ago(t)),
+                    None => println!("  last pulse: none succeeded yet"),
+                }
+                // Next pulse ≈ last attempt + interval.
+                if let Some(attempt) = leg.last_attempt_at_unix {
+                    let next_in = (attempt as i128 + leg.interval_seconds as i128
+                        - status::now_unix() as i128)
+                        .clamp(i64::MIN as i128, i64::MAX as i128)
+                        as i64;
+                    if next_in > 0 {
+                        println!("  next pulse: in ~{}", status::duration_words(next_in));
+                    } else {
+                        println!("  next pulse: due now");
+                    }
+                }
+                println!("  last result: {}", leg.last_result);
             }
-            println!("last result: {}", s.last_result);
         }
     }
     Ok(())
@@ -233,6 +288,113 @@ fn init(args: InitArgs, config_path: &std::path::Path) -> anyhow::Result<()> {
     println!();
     println!("Then start this client (or run `signedpulse-client install-service`).");
     Ok(())
+}
+
+fn add_server(args: AddServerArgs, config_path: &std::path::Path) -> anyhow::Result<()> {
+    // The config must already exist (with a primary [client] server).
+    let existing = ClientConfig::load(config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot load {} ({e}); run `signedpulse-client init` first",
+            config_path.display()
+        )
+    })?;
+
+    // The label becomes the TOML table key; keep it safe and unambiguous.
+    let name = args.name.as_str();
+    if name.is_empty() {
+        anyhow::bail!("--name must not be empty");
+    }
+    if name
+        .chars()
+        .any(|c| c == '"' || c == '\\' || c.is_control())
+    {
+        anyhow::bail!("--name must not contain quotes, backslashes, or control characters");
+    }
+    if name == existing.client.server_id {
+        anyhow::bail!("--name {name:?} collides with the primary [client] server_id; pick another");
+    }
+    if existing.client.servers.contains_key(name) {
+        anyhow::bail!("server {name:?} is already configured");
+    }
+    // The wire server_id defaults to the label, but can differ (it must match the
+    // remote server's configured server_id).
+    let server_id = args.server_id.as_deref().unwrap_or(name);
+
+    let wire_encryption = !args.no_encryption;
+    if wire_encryption && args.server_key.is_none() {
+        anyhow::bail!(
+            "encrypted mode (default) needs --server-key (run the new server's `init` to print \
+             it), or pass --no-encryption"
+        );
+    }
+    if let Some(key) = &args.server_key {
+        crypto::x25519_from_base64(key)
+            .map_err(|e| anyhow::anyhow!("invalid --server-key: {e}"))?;
+    }
+    let server_addr = normalize_addr(&args.server);
+
+    // Append a `[client.servers.<name>]` table at EOF (always valid TOML; leaves
+    // existing content intact). Quote the key if it isn't a bare TOML key.
+    let mut block = format!(
+        "\n[client.servers.{}]\nserver_addr = \"{server_addr}\"\n",
+        toml_table_key(name)
+    );
+    // Only write server_id when it differs from the label (else it's implied).
+    if server_id != name {
+        block.push_str(&format!("server_id = \"{server_id}\"\n"));
+    }
+    if let Some(key) = &args.server_key {
+        block.push_str(&format!("server_encryption_key = \"{key}\"\n"));
+    }
+    if !wire_encryption {
+        block.push_str("wire_encryption = false\n");
+    }
+    if let Some(interval) = args.interval {
+        block.push_str(&format!("interval_seconds = {interval}\n"));
+    }
+
+    let mut text = std::fs::read_to_string(config_path)?;
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&block);
+    // The client config holds the Ed25519 private key, so rewrite it 0600 (and
+    // without following a symlink) — std::fs::write would re-create it 0644.
+    service::write_config_file(config_path, &text, true)?;
+
+    // Re-load to confirm the file still parses and validates.
+    let updated = ClientConfig::load(config_path)?;
+    let total = 1 + updated.client.servers.len();
+    println!(
+        "Added server {name:?} (server_id={server_id:?}, {server_addr}). \
+         This client now pulses {total} server(s)."
+    );
+
+    // Derive this client's public key so the operator can authorize it there.
+    if let Ok(sk) = crypto::load_signing_key(&updated.client.private_key) {
+        let public_key_b64 = B64.encode(sk.verifying_key().to_bytes());
+        println!();
+        println!("Authorize this client on the new server:");
+        println!(
+            "  signedpulse-server add-client --client-id \"{}\" --public-key \"{}\"",
+            updated.client.client_id, public_key_b64
+        );
+    }
+    println!("Then restart this client (e.g. `systemctl restart signedpulse-client`) to apply.");
+    Ok(())
+}
+
+/// Render a `server_id` as a TOML table-header key: bare when it contains only
+/// `[A-Za-z0-9_-]`, otherwise a quoted key (control chars/quotes are rejected by
+/// the caller, so simple quoting is sufficient here).
+fn toml_table_key(s: &str) -> String {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        s.to_string()
+    } else {
+        format!("\"{s}\"")
+    }
 }
 
 fn install_service(args: InstallArgs, config_path: &std::path::Path) -> anyhow::Result<()> {
@@ -343,5 +505,13 @@ mod tests {
     fn normalize_addr_keeps_explicit_port() {
         assert_eq!(normalize_addr("203.0.113.10:9999"), "203.0.113.10:9999");
         assert_eq!(normalize_addr("example.com:5000"), "example.com:5000");
+    }
+
+    #[test]
+    fn toml_table_key_quotes_only_when_needed() {
+        assert_eq!(toml_table_key("signedpulse-backup"), "signedpulse-backup");
+        assert_eq!(toml_table_key("sp_B2"), "sp_B2");
+        // A dot isn't a bare-key character, so it must be quoted.
+        assert_eq!(toml_table_key("a.b"), "\"a.b\"");
     }
 }
