@@ -1,6 +1,8 @@
-//! Library surface of the SignedPulse server, exposed so integration tests can
-//! drive the server with a mock command executor.
+//! Library surface of the SignedPulse server: the verification pipeline plus the
+//! CLI entry point (`cli::run_cli`), exposed so the `signedpulse` umbrella crate
+//! can provide the binary and integration tests can drive the server directly.
 
+pub mod cli;
 pub mod command_runner;
 pub mod nonce_store;
 pub mod rate_limit;

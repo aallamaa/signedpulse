@@ -6,6 +6,12 @@
 *.state.json
 *.state.pid
 
+# Secrets — crates.io tokens, keys (never commit these)
+crate_token.txt
+*token*.txt
+*.key
+*.pem
+
 # Local tooling state
 /.claude/settings.local.json
 

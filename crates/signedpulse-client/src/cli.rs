@@ -1,13 +1,12 @@
-//! `signedpulse-client` binary entry point.
-
-mod client;
+//! CLI entry point for the SignedPulse client (`run_cli`), invoked by the
+//! `signedpulse-client` binary in the `signedpulse` umbrella crate.
 
 use std::path::PathBuf;
 
+use crate::client::Client;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use clap::{Parser, Subcommand};
-use client::Client;
 use signedpulse_common::config::ClientConfig;
 use signedpulse_common::crypto;
 use signedpulse_common::protocol::ClientId;
@@ -111,8 +110,7 @@ struct InstallArgs {
 
 const DEFAULT_PORT: u16 = 7370;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub async fn run_cli() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {

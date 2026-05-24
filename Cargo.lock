@@ -684,6 +684,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "signedpulse"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "signedpulse-client",
+ "signedpulse-server",
+ "tokio",
+]
+
+[[package]]
 name = "signedpulse-client"
 version = "0.1.0"
 dependencies = [

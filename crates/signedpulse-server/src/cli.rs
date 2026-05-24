@@ -1,16 +1,17 @@
-//! `signedpulse-server` binary entry point.
+//! CLI entry point for the SignedPulse server (`run_cli`), invoked by the
+//! `signedpulse-server` binary in the `signedpulse` umbrella crate.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::command_runner::ProcessExecutor;
+use crate::server::Server;
 use clap::{Parser, Subcommand};
 use signedpulse_common::config::ServerConfig;
 use signedpulse_common::crypto;
 use signedpulse_common::service::{self, ServiceSpec, ServiceTarget};
 use signedpulse_common::status::{self, ServerStatusSnapshot};
-use signedpulse_server::command_runner::ProcessExecutor;
-use signedpulse_server::server::Server;
 use tokio::net::UdpSocket;
 use tracing::info;
 
@@ -83,8 +84,7 @@ struct InstallArgs {
     print: bool,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub async fn run_cli() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {

@@ -4,14 +4,17 @@ members = [
     "crates/signedpulse-common",
     "crates/signedpulse-server",
     "crates/signedpulse-client",
+    "crates/signedpulse",
     "xtask",
 ]
-# `cargo build`/`cargo test` (no -p) operate on the real crates only; xtask is
-# built on demand via `cargo deploy`.
+# The `signedpulse` umbrella crate owns the two installable binaries
+# (`cargo install signedpulse`); the others are libraries. xtask is built on
+# demand via `cargo deploy`.
 default-members = [
     "crates/signedpulse-common",
     "crates/signedpulse-server",
     "crates/signedpulse-client",
+    "crates/signedpulse",
 ]
 
 [workspace.package]
@@ -19,9 +22,15 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "PolyForm-Noncommercial-1.0.0"
+# Public repository (shown on crates.io).
+repository = "https://github.com/aallamaa/signedpulse"
 
 [workspace.dependencies]
-signedpulse-common = { path = "crates/signedpulse-common" }
+# Internal crates carry a version (alongside the path) so they resolve from
+# crates.io once published — `cargo publish` drops the path automatically.
+signedpulse-common = { path = "crates/signedpulse-common", version = "0.1.0" }
+signedpulse-server = { path = "crates/signedpulse-server", version = "0.1.0" }
+signedpulse-client = { path = "crates/signedpulse-client", version = "0.1.0" }
 
 tokio = { version = "1", features = [
     "rt-multi-thread",

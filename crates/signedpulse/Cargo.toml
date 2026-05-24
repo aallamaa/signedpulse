@@ -1,0 +1,25 @@
+[package]
+name = "signedpulse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Signed, replay-proof UDP pulse daemon: a server learns and verifies a NAT'd client's real source IP and runs a hook (server + client binaries)"
+keywords = ["udp", "ed25519", "port-knocking", "firewall", "nat"]
+categories = ["command-line-utilities", "network-programming"]
+
+# `cargo install signedpulse` builds both of these.
+[[bin]]
+name = "signedpulse-server"
+path = "src/bin/signedpulse-server.rs"
+
+[[bin]]
+name = "signedpulse-client"
+path = "src/bin/signedpulse-client.rs"
+
+[dependencies]
+signedpulse-server.workspace = true
+signedpulse-client.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Shared protocol, crypto, and config types for SignedPulse"
+repository.workspace = true
 
 [dependencies]
 serde.workspace = true

@@ -297,8 +297,17 @@ signedpulse/
 
 ## Installation & setup
 
-Build and install the two binaries with `cargo deploy` (run from the repo; it
-builds `--release` and installs both binaries, default prefix `/usr/local`):
+The `signedpulse` crate ships **both** binaries (`signedpulse-server` and
+`signedpulse-client`), so a single command installs them to `~/.cargo/bin`:
+
+```sh
+cargo install signedpulse                                   # from crates.io (once published)
+cargo install --git https://github.com/aallamaa/signedpulse signedpulse   # from Git
+cargo install --path crates/signedpulse                     # from a local checkout
+```
+
+For a system-wide install (default prefix `/usr/local`), use `cargo deploy`,
+which builds `--release` and installs both binaries:
 
 ```sh
 sudo cargo deploy                 # installs to /usr/local/bin
@@ -306,9 +315,7 @@ cargo deploy --prefix ~/.local    # user install, no sudo
 cargo deploy --uninstall          # remove them
 ```
 
-(`cargo deploy` is a workspace alias for the bundled `xtask`. As a user-local
-alternative you can also `cargo install --path crates/signedpulse-server` and
-`--path crates/signedpulse-client`, which install to `~/.cargo/bin`.)
+(`cargo deploy` is a workspace alias for the bundled `xtask`.)
 
 The whole setup is three commands once the binaries are in place.
 
