@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
 description = "Signed, replay-proof UDP pulse daemon: a server learns and verifies a NAT'd client's real source IP and runs a hook (server + client binaries)"
 keywords = ["udp", "ed25519", "port-knocking", "firewall", "nat"]
 categories = ["command-line-utilities", "network-programming"]

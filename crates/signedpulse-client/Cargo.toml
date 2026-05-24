@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 description = "SignedPulse client: periodically proves its source IP to the server with a signed pulse"
 repository.workspace = true
+readme.workspace = true
 
 [dependencies]
 signedpulse-common.workspace = true

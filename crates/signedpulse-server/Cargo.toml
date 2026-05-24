@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 description = "SignedPulse server: verifies signed UDP pulses and runs a hook command"
 repository.workspace = true
+readme.workspace = true
 
 [dependencies]
 signedpulse-common.workspace = true

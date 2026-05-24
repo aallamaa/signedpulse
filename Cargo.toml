@@ -18,12 +18,15 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.85"
 license = "PolyForm-Noncommercial-1.0.0"
 # Public repository (shown on crates.io).
 repository = "https://github.com/aallamaa/signedpulse"
+# Shown on each crate's crates.io page. Inherited via `readme.workspace = true`;
+# the path is resolved relative to this workspace root.
+readme = "README.md"
 
 [workspace.dependencies]
 # Internal crates carry a version (alongside the path) so they resolve from
