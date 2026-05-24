@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target
+
+# Local/real configs that may hold secrets (examples/*.toml are fine)
+/etc/
+*.state.json
+*.state.pid
+
+# Local tooling state
+/.claude/settings.local.json
+
+# Editor/OS cruft
+*.swp
+.DS_Store

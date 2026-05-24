@@ -1,0 +1,60 @@
+# Example SignedPulse server configuration.
+# Easiest to generate this with: signedpulse-server init
+# Run with: signedpulse-server --config /etc/signedpulse/server.toml
+
+[server]
+bind = "0.0.0.0:7370"
+server_id = "signedpulse-main"
+nonce_ttl_seconds = 30
+command_timeout_seconds = 10
+client_cooldown_seconds = 60       # 0 disables
+max_packet_size = 2048
+hello_rate_max = 30                # HELLOs per source IP per window (0 disables)
+hello_rate_window_seconds = 60
+hello_max_skew_seconds = 30        # accepted clock skew for signed HELLO timestamps
+# After this many faulty packets from one source IP, blacklist it (dropped
+# before any decryption — bounds CPU-flooding attacks). 0 disables.
+max_faulty_packets = 10
+blacklist_seconds = 300
+# Lockdown: if more than this many distinct IPs are blacklisted within
+# attack_window_seconds, only serve source IPs that recently completed a
+# handshake (others dropped before decryption). 0 disables lockdown.
+attack_blacklist_threshold = 10
+attack_window_seconds = 10
+# Also enter lockdown if more than this many packets are rejected within the
+# window (catches floods of well-formed-but-unauthenticated packets). 0 disables.
+attack_rejection_threshold = 256
+# How long a source IP stays "active" (lockdown allow-list) after a successful
+# exchange. Keep comfortably above your clients' interval_seconds.
+active_ip_ttl_seconds = 900
+# Max datagrams processed concurrently; excess is dropped while at capacity, so a
+# flood cannot spawn unbounded decryption work. 0 = unbounded.
+max_inflight_packets = 1024
+# Hard cap on distinct blacklist-tracked source IPs (bounds memory under a
+# spoofed-source flood). 0 = unbounded.
+max_tracked_ips = 100000
+# "required" => every datagram is an opaque sealed blob (nothing is visible to a
+# sniffer). "off" => compact binary cleartext (still signed; param still sealed).
+wire_encryption = "required"
+# Base64 X25519 secret used to decrypt sealed datagrams and the param. Generated
+# by `signedpulse-server init`; its public half is given to clients. KEEP SECRET.
+encryption_private_key = "REPLACE_WITH_BASE64_X25519_SECRET"
+# Maximum decrypted parameter length in bytes.
+max_param_len = 256
+
+[command]
+# argv array. Placeholders are substituted as literal arguments (no shell):
+#   {ip}          -> source IP from the UDP packet metadata
+#   {client_id}   -> verified client id (hex)
+#   {source_port} -> source UDP port from the packet metadata
+#   {param}       -> the decrypted client-supplied parameter (if any)
+argv = ["/usr/local/sbin/signedpulse-hook", "{ip}", "{client_id}", "{param}"]
+working_dir = "/"
+max_concurrent = 4
+allow_shell = false                # DANGEROUS if true; keep false
+
+# Authorize each client (use `signedpulse-server add-client`, or add blocks here).
+[[clients]]
+client_id = "REPLACE_WITH_64_HEX_CHARS_256_BIT_CLIENT_ID"
+public_key = "REPLACE_WITH_BASE64_ED25519_PUBLIC_KEY"
+label = "laptop-1"

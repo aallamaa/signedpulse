@@ -1,0 +1,4 @@
+[alias]
+# `cargo deploy [--prefix .. --bindir .. --destdir .. --no-build --uninstall]`
+# builds the release binaries and installs them. Run from the repo checkout.
+deploy = "run -q -p xtask --"

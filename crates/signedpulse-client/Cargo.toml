@@ -1,0 +1,22 @@
+[package]
+name = "signedpulse-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SignedPulse client: periodically proves its source IP to the server with a signed pulse"
+
+[[bin]]
+name = "signedpulse-client"
+path = "src/main.rs"
+
+[dependencies]
+signedpulse-common.workspace = true
+ed25519-dalek.workspace = true
+base64.workspace = true
+zeroize.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
