@@ -8,14 +8,16 @@ when a source IP stops pulsing:
 
     [command]
     argv        = ["/usr/local/sbin/signedpulse-hook", "grant",  "{ip}", "{client_id}", "{new}"]
-    revoke_argv = ["/usr/local/sbin/signedpulse-hook", "revoke", "{ip}", "{client_id}"]
+    revoke_argv = ["/usr/local/sbin/signedpulse-hook", "revoke", "{ip}", "{client_id}", "{reason}"]
 
 so this script receives, positionally:
 
-    argv[1] action     "grant" (each verified pulse) or "revoke" (lease expired)
-    argv[2] ip         the client's REAL source IP, from UDP packet metadata
-    argv[3] client_id  the verified 64-hex client id
-    argv[4] new        "1" on a new/reactivated session, "0" on a renewal (grant only)
+    argv[1] action       "grant" (each verified pulse) or "revoke" (access dropped)
+    argv[2] ip           the client's REAL source IP, from UDP packet metadata
+    argv[3] client_id    the verified 64-hex client id
+    argv[4] new/reason   grant: "1" on a new/reactivated session, "0" on a renewal;
+                         revoke: why it fired — "expired" (lease timed out) or
+                         "bye" (client released it on shutdown)
 
 The placeholders ({ip} {client_id} {source_port} {param} {new}) are passed as
 LITERAL argv elements — never through a shell — so they are safe to use directly.
@@ -73,7 +75,9 @@ def main() -> int:
         return 2
 
     action, ip_str, client_id = args[0], args[1], args[2]
+    # 4th arg is {new} for grant, {reason} for revoke (the action selects meaning).
     is_new = len(args) > 3 and args[3] == "1"
+    reason = args[3] if len(args) > 3 else "expired"
     who = client_id[:12]  # the server already validated this is canonical hex
 
     # The server passes the kernel-observed source IP, but validate defensively
@@ -102,7 +106,7 @@ def main() -> int:
         # `delete element` errors if it's already gone — treat that as success.
         r = run_nft("delete", ip)
         ok = r.returncode == 0 or benign(r.stderr, "does not exist", "no such")
-        syslog.syslog(syslog.LOG_NOTICE, "revoked %s client=%s… (lease expired)" % (ip, who))
+        syslog.syslog(syslog.LOG_NOTICE, "revoked %s client=%s… (reason=%s)" % (ip, who, reason))
         if not ok:
             syslog.syslog(syslog.LOG_ERR, "nft delete failed for %s: %s" % (ip, r.stderr.strip()))
             return r.returncode or 1

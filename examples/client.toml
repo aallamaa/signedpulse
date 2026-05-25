@@ -18,6 +18,10 @@ retry_initial_ms = 500
 retry_max_ms = 4000
 retries = 3
 # (challenge_timeout_seconds is deprecated and ignored; superseded by the above.)
+# On graceful shutdown (SIGTERM/Ctrl-C), send a signed BYE to each server so it
+# releases this client's access lease now (runs the revoke hook immediately)
+# instead of waiting for the lease to time out. Default true; set false to skip.
+bye_on_shutdown = true
 # Seal every datagram to the server (default). Must match server wire_encryption.
 wire_encryption = true
 # Server's base64 X25519 public key (printed by `signedpulse-server init`).

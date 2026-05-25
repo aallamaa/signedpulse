@@ -54,12 +54,15 @@ max_param_len = 256
 #   {param}       -> the decrypted client-supplied parameter (if any)
 #   {new}         -> "1" on a new/reactivated session (first pulse, or first
 #                    after the access lease expired), "0" on a keep-alive renewal
+#   {reason}      -> why the hook ran: "grant" (verified pulse), "expired"
+#                    (lease timed out), or "bye" (client released it on shutdown)
 argv = ["/usr/local/sbin/signedpulse-hook", "grant", "{ip}", "{client_id}", "{new}"]
-# Optional REVOKE hook: runs when a source IP stops pulsing for the lease TTL,
-# closing what `argv` opened. Same placeholders ({new} is always "0" here);
-# reuses working_dir/max_concurrent/allow_shell/command_timeout. Make it
-# IDEMPOTENT. Omit to leave access open once granted (the original behavior).
-# revoke_argv = ["/usr/local/sbin/signedpulse-hook", "revoke", "{ip}", "{client_id}"]
+# Optional REVOKE hook: runs when a source IP stops pulsing for the lease TTL, or
+# immediately when the client sends a BYE on shutdown — closing what `argv`
+# opened. Same placeholders ({new} is always "0" here; use {reason} to tell a
+# "bye" from an "expired" timeout). Reuses working_dir/max_concurrent/allow_shell/
+# command_timeout. Make it IDEMPOTENT. Omit to leave access open once granted.
+# revoke_argv = ["/usr/local/sbin/signedpulse-hook", "revoke", "{ip}", "{client_id}", "{reason}"]
 working_dir = "/"
 max_concurrent = 4
 allow_shell = false                # DANGEROUS if true; keep false

@@ -14,7 +14,8 @@ use base64::Engine;
 use signedpulse_common::config::ServerConfig;
 use signedpulse_common::crypto::{self, X25519Bytes};
 use signedpulse_common::protocol::{
-    hello_signing_payload, response_signing_payload, ClientId, Hello, Packet, Response,
+    bye_signing_payload, hello_signing_payload, response_signing_payload, Bye, ClientId, Hello,
+    Packet, Response,
 };
 use signedpulse_server::server::Server;
 use signedpulse_server::testing::MockCommandExecutor;
@@ -197,6 +198,80 @@ impl Fixture {
         sock.send_to(&datagram, self.addr).await.unwrap();
         datagram
     }
+
+    /// Run HELLO → CHALLENGE → BYE (lease release); return the BYE datagram. If
+    /// `forge_response` is set, the BYE is signed over the RESPONSE payload
+    /// instead of the BYE payload — domain separation means the server must
+    /// reject it (proves a captured RESPONSE can't be re-framed as a release).
+    async fn bye(&self, sock: &UdpSocket, param: Option<&str>, forge_response: bool) -> Vec<u8> {
+        let client_hex = self.client_id.to_hex();
+
+        // HELLO
+        let ts = now_unix();
+        let hello_nonce: [u8; 16] = crypto::Nonce::generate().0[..16].try_into().unwrap();
+        let hp = hello_signing_payload(SERVER_ID, &client_hex, ts, &B64.encode(hello_nonce));
+        let hello = Packet::Hello(Hello {
+            client_id: self.client_id,
+            client_timestamp_unix: ts,
+            hello_nonce,
+            signature: crypto::sign_payload_raw(&self.signing_key, &hp),
+        });
+        let (datagram, eph) = self.frame(&hello.encode());
+        sock.send_to(&datagram, self.addr).await.unwrap();
+
+        // CHALLENGE
+        let mut buf = vec![0u8; 4096];
+        let len = tokio::time::timeout(Duration::from_secs(2), sock.recv(&mut buf))
+            .await
+            .expect("challenge timed out")
+            .unwrap();
+        let challenge =
+            match Packet::decode(&self.unframe(&buf[..len], eph.as_ref(), &hello_nonce)).unwrap() {
+                Packet::Challenge(c) => c,
+                other => panic!("expected challenge, got {other:?}"),
+            };
+
+        // BYE (same fields as RESPONSE; distinct signing payload unless forging).
+        let param_blob = param.map(|p| {
+            crypto::seal(&self.server_pub, p.as_bytes(), crypto::CTX_PARAM)
+                .unwrap()
+                .0
+        });
+        let param_b64 = param_blob
+            .as_ref()
+            .map(|b| B64.encode(b))
+            .unwrap_or_default();
+        let nonce_b64 = B64.encode(challenge.nonce);
+        let payload = if forge_response {
+            response_signing_payload(
+                SERVER_ID,
+                &client_hex,
+                &nonce_b64,
+                TEST_INTERVAL_SECS,
+                challenge.expires_at_unix,
+                &param_b64,
+            )
+        } else {
+            bye_signing_payload(
+                SERVER_ID,
+                &client_hex,
+                &nonce_b64,
+                TEST_INTERVAL_SECS,
+                challenge.expires_at_unix,
+                &param_b64,
+            )
+        };
+        let bye = Packet::Bye(Bye {
+            client_id: self.client_id,
+            nonce: challenge.nonce,
+            interval_seconds: TEST_INTERVAL_SECS,
+            param: param_blob,
+            signature: crypto::sign_payload_raw(&self.signing_key, &payload),
+        });
+        let (datagram, _) = self.frame(&bye.encode());
+        sock.send_to(&datagram, self.addr).await.unwrap();
+        datagram
+    }
 }
 
 async fn recv_timeout(sock: &UdpSocket) -> Option<Vec<u8>> {
@@ -339,4 +414,79 @@ async fn lease_grants_marks_new_then_revokes_on_expiry() {
     assert_eq!(revoked[0].source_ip, local.ip());
     assert_eq!(revoked[0].client_id, fx.client_id.to_hex());
     assert!(!revoked[0].is_new, "revoke is not a new session");
+    assert_eq!(revoked[0].reason, "expired", "lease-timeout revoke");
+}
+
+#[tokio::test]
+async fn bye_releases_lease_and_runs_revoke_with_param() {
+    let fx = fixture(true, 256, None).await;
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let local = sock.local_addr().unwrap();
+
+    // Pulse to establish the lease (grant fires once).
+    fx.handshake(&sock, None).await;
+    wait_for(|| fx.mock.count() >= 1).await;
+    assert_eq!(fx.revoke.count(), 0, "no revoke yet");
+
+    // A signed BYE (carrying its own param) releases the lease immediately —
+    // no waiting for expiry, no forced scan.
+    fx.bye(&sock, Some("bye-param"), false).await;
+    wait_for(|| fx.revoke.count() >= 1).await;
+    let revoked = fx.revoke.executions();
+    assert_eq!(revoked.len(), 1);
+    assert_eq!(revoked[0].source_ip, local.ip());
+    assert_eq!(revoked[0].client_id, fx.client_id.to_hex());
+    assert_eq!(revoked[0].param.as_deref(), Some("bye-param"));
+    assert!(!revoked[0].is_new);
+    assert_eq!(revoked[0].reason, "bye", "client-initiated release");
+
+    // The lease is gone: re-pulsing is flagged as a brand-new session.
+    let sock2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    fx.handshake(&sock2, None).await;
+    wait_for(|| fx.mock.count() >= 2).await;
+    let grants = fx.mock.executions();
+    assert!(
+        grants.last().unwrap().is_new,
+        "post-BYE pulse is a new session"
+    );
+}
+
+#[tokio::test]
+async fn bye_signed_as_response_is_rejected() {
+    let fx = fixture(true, 256, None).await;
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // Establish a lease.
+    fx.handshake(&sock, None).await;
+    wait_for(|| fx.mock.count() >= 1).await;
+
+    // A BYE signed over the RESPONSE payload (domain-separation attack) must be
+    // rejected: the lease stays, the revoke hook never runs.
+    fx.bye(&sock, None, true).await;
+    // Give the server a moment to (not) act.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        fx.revoke.count(),
+        0,
+        "forged BYE must not release the lease"
+    );
+}
+
+#[tokio::test]
+async fn replayed_bye_does_not_revoke_twice() {
+    let fx = fixture(true, 256, None).await;
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    fx.handshake(&sock, None).await;
+    wait_for(|| fx.mock.count() >= 1).await;
+
+    let bye_datagram = fx.bye(&sock, None, false).await;
+    wait_for(|| fx.revoke.count() >= 1).await;
+    assert_eq!(fx.revoke.count(), 1);
+
+    // Replaying the identical BYE datagram: the single-use nonce is spent, so it
+    // is rejected and the revoke hook does not run again.
+    sock.send_to(&bye_datagram, fx.addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(fx.revoke.count(), 1, "replayed BYE must not re-revoke");
 }

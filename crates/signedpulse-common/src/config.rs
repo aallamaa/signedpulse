@@ -404,6 +404,11 @@ pub struct ClientSection {
     /// `wire_encryption` setting.
     #[serde(default = "default_true")]
     pub wire_encryption: bool,
+    /// On graceful shutdown (SIGTERM/Ctrl-C), send a signed BYE to each server to
+    /// release its access lease immediately (runs the revoke hook now instead of
+    /// waiting for the lease to time out). Default true; set false to disable.
+    #[serde(default = "default_true")]
+    pub bye_on_shutdown: bool,
     /// Additional servers to pulse, configured as `[client.servers.<name>]`
     /// tables. The table key is a *local label* used for status and uniqueness,
     /// not necessarily the wire `server_id` (see [`ServerOverride::server_id`]).

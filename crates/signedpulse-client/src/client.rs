@@ -18,7 +18,8 @@ use ed25519_dalek::SigningKey;
 use signedpulse_common::config::{ClientConfig, ClientSection, ServerOverride};
 use signedpulse_common::crypto::{self, Nonce, X25519Bytes};
 use signedpulse_common::protocol::{
-    hello_signing_payload, response_signing_payload, ClientId, Hello, Packet, Response,
+    bye_signing_payload, hello_signing_payload, response_signing_payload, Bye, ClientId, Hello,
+    Packet, Response,
 };
 use signedpulse_common::status::{self, ClientStatusSnapshot, ServerLegStatus};
 use tokio::net::UdpSocket;
@@ -82,6 +83,17 @@ struct ServerTarget {
     param_max_len: usize,
 }
 
+/// Whether a handshake renews the access lease (a normal pulse / RESPONSE) or
+/// releases it early (a BYE — clean shutdown). Both share the same
+/// HELLO → CHALLENGE → … exchange and single-use nonce; only the final signed
+/// packet differs, with a distinct signing payload so neither can be replayed
+/// as the other.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Renew,
+    Release,
+}
+
 /// Holds the shared client identity and the resolved set of server targets.
 pub struct Client {
     signing_key: SigningKey,
@@ -89,6 +101,8 @@ pub struct Client {
     targets: Vec<ServerTarget>,
     status: Arc<Mutex<ClientStatusSnapshot>>,
     state_path: PathBuf,
+    /// Send a signed BYE to each server on graceful shutdown (releases leases now).
+    bye_on_shutdown: bool,
 }
 
 impl Client {
@@ -153,6 +167,7 @@ impl Client {
             targets,
             status,
             state_path,
+            bye_on_shutdown: c.bye_on_shutdown,
         })
     }
 
@@ -164,9 +179,14 @@ impl Client {
         }
     }
 
-    /// Run forever: spawn one pulse loop per server target, then serve on-demand
-    /// status dumps (SIGUSR1) for the life of the process.
-    pub async fn run_forever(&self) -> anyhow::Result<()> {
+    /// Run until `shutdown` resolves: spawn one pulse loop per server target and
+    /// serve on-demand status dumps (SIGUSR1). On a clean shutdown, if
+    /// `bye_on_shutdown` is set, send a signed BYE to each server so their access
+    /// leases are released immediately instead of waiting to time out.
+    pub async fn run_forever<F>(&self, shutdown: F) -> anyhow::Result<()>
+    where
+        F: std::future::Future<Output = ()>,
+    {
         info!(
             client_id = %self.client_id.to_hex(),
             servers = self.targets.len(),
@@ -186,12 +206,7 @@ impl Client {
         // restarts all legs.
         let mut legs = tokio::task::JoinSet::new();
         for target in &self.targets {
-            let pulser = Pulser {
-                signing_key: self.signing_key.clone(),
-                client_id: self.client_id,
-                target: target.clone(),
-                status: self.status.clone(),
-            };
+            let pulser = self.pulser_for(target);
             let name = target.name.clone();
             legs.spawn(async move {
                 pulser.run_loop().await;
@@ -199,9 +214,15 @@ impl Client {
             });
         }
 
-        // Stay alive to answer status-dump requests; abort if any leg stops.
+        // Stay alive to answer status-dump requests; abort if any leg stops;
+        // stop cleanly when the shutdown signal arrives.
+        tokio::pin!(shutdown);
         loop {
             tokio::select! {
+                _ = &mut shutdown => {
+                    info!("shutdown signal received, stopping pulse loops");
+                    break;
+                }
                 _ = dump.recv() => self.write_status(),
                 joined = legs.join_next() => match joined {
                     Some(Ok(name)) => {
@@ -216,25 +237,76 @@ impl Client {
                 },
             }
         }
+
+        // Stop renewing leases (dropping the JoinSet aborts every leg), then
+        // best-effort release each lease with a signed BYE.
+        legs.abort_all();
+        drop(legs);
+        if self.bye_on_shutdown {
+            self.send_bye_all().await;
+        }
+        Ok(())
     }
 
-    /// One-shot: run a single handshake against every configured server and
-    /// exit. With `retry` false (`pulse`) each server gets exactly one attempt;
-    /// with `retry` true (`ping`) the configured SIP retry/backoff is used.
-    /// Prints a per-server result line and returns `Err` if any server failed,
-    /// so the process exit code reflects success (useful in scripts/cron).
-    pub async fn run_once(&self, retry: bool) -> anyhow::Result<()> {
+    /// Best-effort: send a signed BYE to every server so its access lease is
+    /// released now. Failures are logged, not fatal — a dropped BYE just means
+    /// the lease times out as it would have without this feature.
+    async fn send_bye_all(&self) {
+        info!(servers = self.targets.len(), "releasing leases (BYE)");
+        for target in &self.targets {
+            let pulser = self.pulser_for(target);
+            match pulser.run_cycle(1, Mode::Release, None).await {
+                Ok(()) => info!(server = %target.name, "sent BYE; lease released"),
+                Err(e) => warn!(server = %target.name, error = %e, "failed to send BYE"),
+            }
+        }
+    }
+
+    /// Build a single-shot `Pulser` for `target` (shares the signing key,
+    /// client id, and status snapshot).
+    fn pulser_for(&self, target: &ServerTarget) -> Pulser {
+        Pulser {
+            signing_key: self.signing_key.clone(),
+            client_id: self.client_id,
+            target: target.clone(),
+            status: self.status.clone(),
+        }
+    }
+
+    /// One-shot pulse: renew the lease on every configured server and exit. With
+    /// `retry` false (`pulse`) each server gets exactly one attempt; with `retry`
+    /// true (`ping`) the configured SIP retry/backoff is used. `param`, when set,
+    /// overrides `param_command` for this run (an ad-hoc one-shot parameter).
+    pub async fn run_once(&self, retry: bool, param: Option<&str>) -> anyhow::Result<()> {
+        self.run_targets(Mode::Renew, retry, param).await
+    }
+
+    /// One-shot release: send a signed BYE to every configured server (the `bye`
+    /// subcommand). One attempt per server; prints a per-server result line.
+    /// `param`, when set, is sealed and passed to the server's revoke hook.
+    pub async fn release_all(&self, param: Option<&str>) -> anyhow::Result<()> {
+        self.run_targets(Mode::Release, false, param).await
+    }
+
+    /// Run one handshake (`mode`) against every configured server, printing a
+    /// per-server result line and returning `Err` if any server failed, so the
+    /// process exit code reflects success (useful in scripts/cron).
+    async fn run_targets(
+        &self,
+        mode: Mode,
+        retry: bool,
+        param: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let ok_word = match mode {
+            Mode::Renew => "ok",
+            Mode::Release => "released",
+        };
         let mut failures = 0usize;
         for target in &self.targets {
-            let pulser = Pulser {
-                signing_key: self.signing_key.clone(),
-                client_id: self.client_id,
-                target: target.clone(),
-                status: self.status.clone(),
-            };
+            let pulser = self.pulser_for(target);
             let attempts = if retry { target.retries.max(1) } else { 1 };
-            match pulser.run_cycle(attempts).await {
-                Ok(()) => println!("{} ({}): ok", target.name, target.server_addr),
+            match pulser.run_cycle(attempts, mode, param).await {
+                Ok(()) => println!("{} ({}): {ok_word}", target.name, target.server_addr),
                 Err(e) => {
                     println!("{} ({}): FAILED — {e}", target.name, target.server_addr);
                     failures += 1;
@@ -356,7 +428,7 @@ impl Pulser {
             {
                 leg.last_attempt_at_unix = Some(now);
             }
-            let result = self.run_cycle(self.target.retries).await;
+            let result = self.run_cycle(self.target.retries, Mode::Renew, None).await;
             {
                 let mut s = self.status.lock().unwrap();
                 if let Some(leg) = s.servers.get_mut(&self.target.name) {
@@ -376,14 +448,31 @@ impl Pulser {
         }
     }
 
-    /// One full HELLO → CHALLENGE → RESPONSE exchange. `max_attempts` bounds the
-    /// retransmits: the daemon and `ping` pass the configured `retries`; a
-    /// single-shot `pulse` passes 1. The per-attempt CHALLENGE wait follows the
-    /// SIP backoff `min(retry_initial · 2^(k-1), retry_max)`, so attempt 1 waits
-    /// `retry_initial` (T1) and a 1-attempt `pulse` is the quick single try (not
-    /// the full T2 window). The parameter is generated once and reused.
-    async fn run_cycle(&self, max_attempts: u32) -> anyhow::Result<()> {
-        let param = self.generate_param().await?;
+    /// One full HELLO → CHALLENGE → RESPONSE|BYE exchange. `max_attempts` bounds
+    /// the retransmits: the daemon and `ping` pass the configured `retries`; a
+    /// single-shot `pulse`/`bye` passes 1. The per-attempt CHALLENGE wait follows
+    /// the SIP backoff `min(retry_initial · 2^(k-1), retry_max)`, so attempt 1
+    /// waits `retry_initial` (T1) and a 1-attempt try is the quick single shot
+    /// (not the full T2 window). For `Renew`, the parameter is resolved once
+    /// (`param_override`, else `param_command`) and reused; `Release` (BYE)
+    /// carries no parameter.
+    async fn run_cycle(
+        &self,
+        max_attempts: u32,
+        mode: Mode,
+        param_override: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let param: Option<String> = match (mode, param_override) {
+            // An explicit override is validated and used as-is for either mode.
+            (_, Some(p)) => {
+                validate_param(p, self.target.param_max_len)?;
+                Some(p.to_string())
+            }
+            // A normal pulse falls back to `param_command`; a release with no
+            // explicit param carries none.
+            (Mode::Renew, None) => self.generate_param().await?,
+            (Mode::Release, None) => None,
+        };
 
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
         socket.connect(&self.target.server_addr).await?;
@@ -397,7 +486,10 @@ impl Pulser {
                 .retry_initial
                 .saturating_mul(1u32 << (attempt - 1).min(31))
                 .min(self.target.retry_max);
-            match self.attempt_once(&socket, param.as_deref(), timeout).await {
+            match self
+                .attempt_once(&socket, param.as_deref(), timeout, mode)
+                .await
+            {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     warn!(server = %self.target.name, attempt, max = attempts, timeout_ms = timeout.as_millis() as u64, error = %e, "handshake attempt failed")
@@ -412,6 +504,7 @@ impl Pulser {
         socket: &UdpSocket,
         param: Option<&str>,
         timeout: Duration,
+        mode: Mode,
     ) -> anyhow::Result<()> {
         let encrypt = self.target.wire_encryption;
         let client_hex = self.client_id.to_hex();
@@ -459,7 +552,9 @@ impl Pulser {
         }
         info!(server = %self.target.name, expires_at = challenge.expires_at_unix, "received CHALLENGE");
 
-        // 4. Seal the optional parameter and build the signed RESPONSE.
+        // 4. Seal the optional parameter (shared by RESPONSE and BYE — both carry
+        //    one) and advertise our pulse interval so the server can size the
+        //    access lease. Both are covered by the signature (encrypt-then-sign).
         let param_blob = match param {
             Some(p) => Some(self.seal_param(p)?),
             None => None,
@@ -468,29 +563,55 @@ impl Pulser {
             .as_ref()
             .map(|b| B64.encode(b))
             .unwrap_or_default();
-        // Advertise our pulse interval so the server can size the access lease
-        // (when to expect our next pulse). Signed alongside the rest.
         let interval_seconds = self.target.interval.as_secs().min(u32::MAX as u64) as u32;
-        let payload = response_signing_payload(
-            &self.target.server_id,
-            &client_hex,
-            &B64.encode(challenge.nonce),
-            interval_seconds,
-            challenge.expires_at_unix,
-            &param_b64,
-        );
-        let response = Packet::Response(Response {
-            client_id: self.client_id,
-            nonce: challenge.nonce,
-            interval_seconds,
-            param: param_blob,
-            signature: crypto::sign_payload_raw(&self.signing_key, &payload),
-        });
+        let nonce_b64 = B64.encode(challenge.nonce);
 
-        // 5. Send the RESPONSE (sealed if encrypting). No reply expected.
-        let (datagram, _) = self.frame_outbound(&response.encode(), encrypt)?;
+        // 5. Build the final signed packet. A RESPONSE renews the lease; a BYE
+        //    releases it. Same fields, but a distinct signing payload (`:bye` vs
+        //    `:response`) so neither can be replayed/re-framed as the other.
+        let (packet, kind) = match mode {
+            Mode::Renew => {
+                let payload = response_signing_payload(
+                    &self.target.server_id,
+                    &client_hex,
+                    &nonce_b64,
+                    interval_seconds,
+                    challenge.expires_at_unix,
+                    &param_b64,
+                );
+                let response = Packet::Response(Response {
+                    client_id: self.client_id,
+                    nonce: challenge.nonce,
+                    interval_seconds,
+                    param: param_blob,
+                    signature: crypto::sign_payload_raw(&self.signing_key, &payload),
+                });
+                (response, "RESPONSE")
+            }
+            Mode::Release => {
+                let payload = bye_signing_payload(
+                    &self.target.server_id,
+                    &client_hex,
+                    &nonce_b64,
+                    interval_seconds,
+                    challenge.expires_at_unix,
+                    &param_b64,
+                );
+                let bye = Packet::Bye(Bye {
+                    client_id: self.client_id,
+                    nonce: challenge.nonce,
+                    interval_seconds,
+                    param: param_blob,
+                    signature: crypto::sign_payload_raw(&self.signing_key, &payload),
+                });
+                (bye, "BYE")
+            }
+        };
+
+        // 6. Send it (sealed if encrypting). No reply expected.
+        let (datagram, _) = self.frame_outbound(&packet.encode(), encrypt)?;
         socket.send(&datagram).await?;
-        info!(server = %self.target.name, "sent RESPONSE");
+        info!(server = %self.target.name, "sent {kind}");
         Ok(())
     }
 
@@ -580,18 +701,26 @@ impl Pulser {
         let text = String::from_utf8(output.stdout)
             .map_err(|_| anyhow::anyhow!("param_command output is not UTF-8"))?;
         let trimmed = text.trim();
-        if trimmed.len() > self.target.param_max_len {
-            anyhow::bail!(
-                "param ({} bytes) exceeds param_max_len {}",
-                trimmed.len(),
-                self.target.param_max_len
-            );
-        }
-        if trimmed.chars().any(|c| c.is_control()) {
-            anyhow::bail!("param contains control characters");
-        }
+        validate_param(trimmed, self.target.param_max_len)?;
         Ok(Some(trimmed.to_string()))
     }
+}
+
+/// Validate a parameter value before sending: bounded length and no control
+/// characters (it ends up in hook argv, logs, and `status`). Used for both the
+/// `param_command` output and an ad-hoc `--param` override.
+fn validate_param(value: &str, max_len: usize) -> anyhow::Result<()> {
+    if value.len() > max_len {
+        anyhow::bail!(
+            "param ({} bytes) exceeds param_max_len {}",
+            value.len(),
+            max_len
+        );
+    }
+    if value.chars().any(|c| c.is_control()) {
+        anyhow::bail!("param contains control characters");
+    }
+    Ok(())
 }
 
 fn now_unix() -> i64 {

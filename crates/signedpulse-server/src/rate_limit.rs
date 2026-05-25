@@ -519,6 +519,26 @@ impl LeaseTracker {
         is_new
     }
 
+    /// Remove and return the lease for `ip` — for a client-initiated release
+    /// (BYE) — but only if it is owned by `client_id`. The ownership check stops
+    /// one client from releasing another's lease when they share a source IP
+    /// (NAT): the per-IP lease slot is held by whoever pulsed last, so a BYE from
+    /// a different client must not tear it down. Returns the data needed to run
+    /// the revoke hook, or `None` if there is no lease or it belongs to someone
+    /// else.
+    pub fn release(&self, ip: IpAddr, client_id: &str) -> Option<ExpiredLease> {
+        let mut leases = self.leases.lock().unwrap();
+        if !matches!(leases.get(&ip), Some(l) if l.client_id == client_id) {
+            return None;
+        }
+        leases.remove(&ip).map(|l| ExpiredLease {
+            ip,
+            client_id: l.client_id,
+            source_port: l.source_port,
+            param: l.param,
+        })
+    }
+
     /// Whether `ip` currently holds a non-expired lease. Used by the revoke sweep
     /// to skip an IP that re-pulsed (and got a fresh lease) since it expired,
     /// avoiding a stale revoke tearing down access a concurrent grant re-opened.
@@ -654,6 +674,31 @@ mod tests {
         assert_eq!(one.client_id, "bob");
         assert_eq!(one.source_port, 2);
         assert_eq!(one.param.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn lease_release_requires_matching_client() {
+        let lt = LeaseTracker::new(1024);
+        let ttl = Duration::from_secs(10);
+        // alice and bob share a source IP (NAT); bob pulsed last, so he owns the
+        // per-IP lease slot.
+        lt.renew_at(ip(1), "alice", 1, None, ttl, Instant::now());
+        lt.renew_at(ip(1), "bob", 2, None, ttl, Instant::now());
+
+        // A BYE from alice must NOT release bob's lease.
+        assert!(lt.release(ip(1), "alice").is_none());
+        assert!(
+            lt.is_live(ip(1)),
+            "alice's BYE must leave bob's lease intact"
+        );
+
+        // bob (the owner) can release it; a second release is then a no-op.
+        let released = lt.release(ip(1), "bob").expect("owner releases own lease");
+        assert_eq!(released.client_id, "bob");
+        assert!(lt.release(ip(1), "bob").is_none());
+
+        // Releasing an IP with no lease at all is a no-op.
+        assert!(lt.release(ip(2), "anyone").is_none());
     }
 
     #[test]

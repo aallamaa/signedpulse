@@ -35,15 +35,25 @@ enum Command {
     /// Add another server to pulse, appended to an existing client config.
     AddServer(AddServerArgs),
     /// Send a single pulse to each configured server and exit (no retry).
-    Pulse,
+    Pulse(PulseArgs),
     /// Like `pulse`, but retry (SIP backoff) if no reply is received.
-    Ping,
+    Ping(PulseArgs),
+    /// Release the access lease on each configured server (signed BYE) and exit.
+    Bye(PulseArgs),
     /// Generate a new Ed25519 keypair and print the config snippets.
     GenerateKey,
     /// Install (and start) this client as a background service.
     InstallService(InstallArgs),
     /// Show live status of the running client (local-only).
     Status,
+}
+
+#[derive(clap::Args, Debug)]
+struct PulseArgs {
+    /// Ad-hoc parameter to send this run, overriding `param_command`. Sealed and
+    /// signed like the configured param; subject to the same `param_max_len`.
+    #[arg(long)]
+    param: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -120,15 +130,25 @@ pub async fn run_cli() -> anyhow::Result<()> {
     match cli.command {
         Some(Command::Init(args)) => init(args, &cli.config),
         Some(Command::AddServer(args)) => add_server(args, &cli.config),
-        Some(Command::Pulse) => {
+        Some(Command::Pulse(args)) => {
             // One-shot, no retry. No logging subscriber, so the handshake's
             // info/warn are silent and run_once prints clean per-server lines.
             let config = ClientConfig::load(&cli.config)?;
-            Client::from_config(config)?.run_once(false).await
+            Client::from_config(config)?
+                .run_once(false, args.param.as_deref())
+                .await
         }
-        Some(Command::Ping) => {
+        Some(Command::Ping(args)) => {
             let config = ClientConfig::load(&cli.config)?;
-            Client::from_config(config)?.run_once(true).await
+            Client::from_config(config)?
+                .run_once(true, args.param.as_deref())
+                .await
+        }
+        Some(Command::Bye(args)) => {
+            let config = ClientConfig::load(&cli.config)?;
+            Client::from_config(config)?
+                .release_all(args.param.as_deref())
+                .await
         }
         Some(Command::GenerateKey) => {
             generate_key();
@@ -140,8 +160,34 @@ pub async fn run_cli() -> anyhow::Result<()> {
             init_logging();
             let config = ClientConfig::load(&cli.config)?;
             let client = Client::from_config(config)?;
-            client.run_forever().await
+            client.run_forever(shutdown_signal()).await
         }
+    }
+}
+
+/// Resolve when the daemon should shut down cleanly: Ctrl-C, or SIGTERM on unix
+/// (sent by service managers on `stop`). Mirrors the server's handler.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = ctrl_c => {},
+                    _ = term.recv() => {},
+                }
+            }
+            // If we can't install the SIGTERM handler, fall back to Ctrl-C only.
+            Err(_) => ctrl_c.await,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await;
     }
 }
 

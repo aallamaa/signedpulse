@@ -15,7 +15,8 @@ use ed25519_dalek::VerifyingKey;
 use signedpulse_common::config::{ServerConfig, WireEncryption};
 use signedpulse_common::crypto::{self, Nonce, X25519Bytes};
 use signedpulse_common::protocol::{
-    hello_signing_payload, response_signing_payload, Challenge, ClientId, Hello, Packet, Response,
+    bye_signing_payload, hello_signing_payload, response_signing_payload, Bye, Challenge, ClientId,
+    Hello, Packet, Response,
 };
 use signedpulse_common::status::{self, HookInfo, LeaseInfo, PulseInfo, ServerStatusSnapshot};
 use tokio::net::UdpSocket;
@@ -275,7 +276,14 @@ impl Server {
                     continue;
                 }
                 match revoke
-                    .execute(&e.client_id, e.ip, e.source_port, e.param.as_deref(), false)
+                    .execute(
+                        &e.client_id,
+                        e.ip,
+                        e.source_port,
+                        e.param.as_deref(),
+                        false,
+                        "expired",
+                    )
                     .await
                 {
                     Ok(result) => {
@@ -499,6 +507,7 @@ impl Server {
         match packet {
             Packet::Hello(hello) => self.handle_hello(hello, peer, socket, reply).await,
             Packet::Response(resp) => self.handle_response(resp, peer).await,
+            Packet::Bye(bye) => self.handle_bye(bye, peer).await,
             Packet::Challenge(_) => {
                 warn!(%peer, "ignoring unexpected challenge packet sent to server");
                 self.note_rejected(false);
@@ -803,6 +812,7 @@ impl Server {
                 source_port,
                 param.as_deref(),
                 is_new,
+                "grant",
             )
             .await
         {
@@ -824,6 +834,143 @@ impl Server {
                 }
             }
             Err(e) => error!(%peer, client = %name, error = %e, "command execution failed"),
+        }
+    }
+
+    /// Handle a BYE: the client proves a fresh single-use nonce (same anti-replay
+    /// as a RESPONSE) but asks us to RELEASE its access lease now (clean
+    /// shutdown) instead of renewing it. We verify exactly like a RESPONSE —
+    /// known client, valid nonce (single-use, IP-bound), valid signature over the
+    /// distinct BYE payload — then revoke the lease for the source IP immediately.
+    async fn handle_bye(&self, bye: Bye, peer: SocketAddr) {
+        let client_hex = bye.client_id.to_hex();
+        let nonce_b64 = B64.encode(bye.nonce);
+        let param_b64 = bye
+            .param
+            .as_ref()
+            .map(|b| B64.encode(b))
+            .unwrap_or_default();
+
+        // 1. Client must be configured (decoy verify on unknown — see handle_hello).
+        let info = match self.clients.get(&bye.client_id) {
+            Some(info) => info,
+            None => {
+                let payload = bye_signing_payload(
+                    &self.config.server.server_id,
+                    &client_hex,
+                    &nonce_b64,
+                    bye.interval_seconds,
+                    0,
+                    &param_b64,
+                );
+                let _ = crypto::verify_payload_raw(dummy_verifying_key(), &payload, &bye.signature);
+                warn!(%peer, client_id = %bye.client_id, "BYE from unknown client_id");
+                self.note_rejected(false);
+                return;
+            }
+        };
+        let name = info.name.clone();
+
+        // 2. Validate (peek) the nonce — single-use, expiry, client + exact
+        //    source IP:port binding — before verifying so a bad sig can't burn it.
+        //    The stored expiry is bound into the signed payload (parity with
+        //    RESPONSE), so we keep the entry.
+        let entry = match self.nonce_store.validate(
+            &bye.nonce,
+            &client_hex,
+            peer.ip(),
+            peer.port(),
+            now_unix(),
+        ) {
+            Ok(entry) => entry,
+            Err(e) => {
+                warn!(%peer, client = %name, "BYE nonce rejected: {}", e.reason());
+                self.note_rejected(e == ConsumeError::AlreadyUsed);
+                return;
+            }
+        };
+
+        // 3. Verify the signature over the canonical BYE payload (distinct header
+        //    from RESPONSE, so a captured RESPONSE cannot be re-framed as a
+        //    release — and covering the sealed param ciphertext, encrypt-then-sign).
+        let payload = bye_signing_payload(
+            &self.config.server.server_id,
+            &client_hex,
+            &nonce_b64,
+            bye.interval_seconds,
+            entry.expires_at_unix,
+            &param_b64,
+        );
+        if crypto::verify_payload_raw(&info.verifying_key, &payload, &bye.signature).is_err() {
+            warn!(%peer, client = %name, "invalid BYE signature; not releasing");
+            self.note_rejected(false);
+            return;
+        }
+
+        // 4. Consume the nonce (single-use gate — blocks replay).
+        if let Err(e) =
+            self.nonce_store
+                .consume(&bye.nonce, &client_hex, peer.ip(), peer.port(), now_unix())
+        {
+            warn!(%peer, client = %name, "BYE nonce consume failed: {}", e.reason());
+            self.note_rejected(e == ConsumeError::AlreadyUsed);
+            return;
+        }
+
+        // 5. Decrypt the optional BYE param (for the revoke hook). A malformed
+        //    param on an otherwise-valid BYE is rejected (already counted).
+        let bye_param = match self.decrypt_param(bye.param.as_deref(), peer, &name) {
+            Ok(p) => p,
+            Err(()) => return,
+        };
+
+        info!(%peer, client = %name, "BYE received; releasing access lease");
+
+        // 6. Release the lease for the source IP and run the revoke hook now —
+        //    but only the lease this client owns (a co-NAT client must not be
+        //    able to revoke another's access).
+        let Some(e) = self.leases.release(peer.ip(), &client_hex) else {
+            return; // no lease held for this IP/client (already revoked, or not ours)
+        };
+        let Some(revoke) = &self.revoke_executor else {
+            return; // no revoke hook configured; the lease is dropped regardless
+        };
+        let client_name = ClientId::from_hex(&e.client_id)
+            .ok()
+            .and_then(|id| self.clients.get(&id))
+            .map(|info| info.name.clone())
+            .unwrap_or_else(|| e.client_id.clone());
+        // The BYE's own param (if supplied) takes precedence over the param
+        // stored from the last grant, so a client can target the release.
+        let revoke_param = bye_param.or(e.param);
+        match revoke
+            .execute(
+                &e.client_id,
+                e.ip,
+                e.source_port,
+                revoke_param.as_deref(),
+                false,
+                "bye",
+            )
+            .await
+        {
+            Ok(result) => {
+                if result.timed_out {
+                    warn!(ip = %e.ip, "revoke hook timed out");
+                } else {
+                    info!(ip = %e.ip, client = %client_name, exit_code = ?result.exit_code, "access revoked (bye)");
+                }
+                let mut s = self.status.lock().unwrap();
+                s.last_revoke = Some(HookInfo {
+                    client_id: client_name,
+                    source_ip: e.ip,
+                    at_unix: now_unix(),
+                    exit_code: result.exit_code,
+                    timed_out: result.timed_out,
+                    param: revoke_param,
+                });
+            }
+            Err(err) => error!(ip = %e.ip, error = %err, "revoke hook failed"),
         }
     }
 

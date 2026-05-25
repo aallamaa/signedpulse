@@ -60,7 +60,7 @@ pulsing, the server runs `command.revoke_argv` to close it.
 # server.toml
 [command]
 argv        = ["/usr/local/sbin/signedpulse-hook", "grant",  "{ip}", "{client_id}", "{new}"]
-revoke_argv = ["/usr/local/sbin/signedpulse-hook", "revoke", "{ip}", "{client_id}"]
+revoke_argv = ["/usr/local/sbin/signedpulse-hook", "revoke", "{ip}", "{client_id}", "{reason}"]
 ```
 
 The lease TTL is **derived from the client's own pulse interval**, which it
@@ -73,10 +73,55 @@ The grant hook also gets a `{new}` flag: `1` on a **new or reactivated** session
 (first pulse, or the first after the lease expired) and `0` on a keep-alive
 renewal — so you can log/notify only when access is freshly granted.
 
+The revoke hook gets a `{reason}` placeholder so it can tell *why* it ran:
+`expired` (the lease timed out — the client went silent) or `bye` (the client
+released it explicitly on shutdown — see below). The grant hook receives
+`reason=grant`. Use it to branch, e.g. `revoke … "{reason}"` then in the hook
+`case "$reason" in bye) … ;; expired) … ;; esac`.
+
 Make both hooks **idempotent**: the grant runs on every pulse, and because
 leases live in memory a server restart forgets them (a grant may recur and a
 revoke may be skipped until the client pulses again). See
 `examples/signedpulse-hook.sh` for a complete grant/revoke nftables hook.
+
+#### Clean shutdown (BYE)
+
+When the client daemon stops gracefully (SIGTERM / Ctrl-C), it sends a signed
+**BYE** to each server, which **releases the lease immediately** — the revoke
+hook runs right away instead of after the grace period. A BYE is a full
+`HELLO → CHALLENGE → BYE` exchange (same single-use nonce and anti-replay as a
+pulse) signed over a *distinct* payload, so a captured RESPONSE can never be
+re-framed into a release. It is on by default; set `bye_on_shutdown = false` in
+`[client]` to disable. A BYE can also carry an optional `param` (sealed/signed
+like a pulse's) passed to the revoke hook. Old servers that don't understand
+BYE simply drop it and the lease times out as before.
+
+You can also release on demand without stopping the daemon:
+
+```sh
+signedpulse-client bye                 # release the lease on every server
+signedpulse-client bye --param drain   # … and pass {param} to the revoke hook
+```
+
+### One-shot pulse / ping / bye
+
+Besides the long-running daemon (no subcommand), the client has one-shot
+commands that run a single handshake against every configured server and exit
+with a non-zero code if any fails (handy for cron/scripts):
+
+| Command | Retries? | Effect |
+| --- | --- | --- |
+| `signedpulse-client pulse` | no (one attempt) | renew the lease once |
+| `signedpulse-client ping`  | yes (SIP backoff) | renew the lease, retrying |
+| `signedpulse-client bye`   | no | release the lease (signed BYE) |
+
+`pulse` and `ping` send the configured `param_command` output as usual, or you
+can override it for a single run with `--param <value>` (sealed and signed like
+the configured param, subject to the same `param_max_len`):
+
+```sh
+signedpulse-client pulse --param deploy-v2
+```
 
 ## Threat model
 
@@ -172,6 +217,20 @@ param=<base64_ciphertext_or_empty>
 The `interval` is the client's own pulse cadence, advertised so the server knows
 when to expect the next pulse (it drives the access lease — see "Access while
 pulsing"). It is signed, so an on-path attacker cannot alter it.
+
+A **BYE** (clean-shutdown lease release — see "Access while pulsing") uses the
+same fields but a distinct header, so a captured RESPONSE signature can never be
+replayed as a release (and vice versa):
+
+```
+signedpulse:v2:bye
+server_id=<server_id>
+client_id=<client_id_hex>
+nonce=<base64_nonce>
+interval=<advertised_pulse_interval_seconds>
+expires_at=<expires_at_unix>
+param=<base64_ciphertext_or_empty>
+```
 
 HELLO payload (signed with a fresh per-HELLO nonce and a timestamp):
 
@@ -553,11 +612,12 @@ lease_grace_multiplier = 3       # lease TTL = client interval × this (revoke a
 lease_max_seconds = 86400        # cap on a derived lease TTL
 
 [command]
-# Placeholders (literal args, no shell): {ip} {client_id} {source_port} {param} {new}
-#   {new} = "1" on a new/reactivated session, "0" on a keep-alive renewal
+# Placeholders (literal args, no shell): {ip} {client_id} {source_port} {param} {new} {reason}
+#   {new}    = "1" on a new/reactivated session, "0" on a keep-alive renewal
+#   {reason} = "grant" | "expired" (lease timed out) | "bye" (client released it)
 argv = ["/usr/local/sbin/signedpulse-hook", "grant", "{ip}", "{client_id}", "{new}"]
-# Optional auto-revoke when an IP stops pulsing (omit to leave access open):
-revoke_argv = ["/usr/local/sbin/signedpulse-hook", "revoke", "{ip}", "{client_id}"]
+# Optional auto-revoke when an IP stops pulsing or sends a BYE (omit to leave open):
+revoke_argv = ["/usr/local/sbin/signedpulse-hook", "revoke", "{ip}", "{client_id}", "{reason}"]
 working_dir = "/"
 max_concurrent = 4
 allow_shell = false              # DANGEROUS if true; keep false

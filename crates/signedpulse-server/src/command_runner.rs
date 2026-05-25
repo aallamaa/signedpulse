@@ -4,8 +4,9 @@
 //!   * No shell is involved by default. The configured `argv` is executed
 //!     directly via `tokio::process::Command`, so client-derived values can
 //!     never be interpreted as shell syntax.
-//!   * Placeholders (`{ip}`, `{client_id}`, `{source_port}`) are substituted
-//!     into individual argv elements as literal strings.
+//!   * Placeholders (`{ip}`, `{client_id}`, `{source_port}`, `{param}`,
+//!     `{new}`, `{reason}`) are substituted into individual argv elements as
+//!     literal strings.
 //!   * Executions are bounded by a semaphore (`max_concurrent`) and each run
 //!     has a hard timeout.
 
@@ -39,7 +40,9 @@ pub enum CommandError {
 pub trait CommandExecutor: Send + Sync {
     /// Run the hook. `is_new` is `true` when this execution is for a new or
     /// reactivated session (used for the `{new}` placeholder); the revoke path
-    /// passes `false`.
+    /// passes `false`. `reason` fills the `{reason}` placeholder so the hook can
+    /// branch on *why* it ran — `"grant"` (verified pulse), `"expired"` (lease
+    /// timed out), or `"bye"` (client-initiated release).
     async fn execute(
         &self,
         client_id: &str,
@@ -47,13 +50,15 @@ pub trait CommandExecutor: Send + Sync {
         source_port: u16,
         param: Option<&str>,
         is_new: bool,
+        reason: &str,
     ) -> Result<CommandResult, CommandError>;
 }
 
 /// Substitute the supported placeholders in a single argv element. Values are
 /// inserted literally; there is no shell or glob interpretation anywhere. The
 /// `param` is the decrypted client-supplied value (empty string when absent);
-/// `new` is `"1"`/`"0"` for the `{new}` flag.
+/// `new` is `"1"`/`"0"` for the `{new}` flag; `reason` is why the hook ran
+/// (`"grant"`/`"expired"`/`"bye"`).
 pub fn substitute_placeholders(
     arg: &str,
     ip: IpAddr,
@@ -61,12 +66,14 @@ pub fn substitute_placeholders(
     source_port: u16,
     param: &str,
     new: &str,
+    reason: &str,
 ) -> String {
     arg.replace("{ip}", &ip.to_string())
         .replace("{client_id}", client_id)
         .replace("{source_port}", &source_port.to_string())
         .replace("{param}", param)
         .replace("{new}", new)
+        .replace("{reason}", reason)
 }
 
 /// Build the fully substituted argv from a template.
@@ -77,10 +84,11 @@ pub fn build_argv(
     source_port: u16,
     param: &str,
     new: &str,
+    reason: &str,
 ) -> Vec<String> {
     template
         .iter()
-        .map(|a| substitute_placeholders(a, ip, client_id, source_port, param, new))
+        .map(|a| substitute_placeholders(a, ip, client_id, source_port, param, new, reason))
         .collect()
 }
 
@@ -117,8 +125,17 @@ impl ProcessExecutor {
         source_port: u16,
         param: &str,
         new: &str,
+        reason: &str,
     ) -> tokio::process::Command {
-        let argv = build_argv(&self.argv_template, ip, client_id, source_port, param, new);
+        let argv = build_argv(
+            &self.argv_template,
+            ip,
+            client_id,
+            source_port,
+            param,
+            new,
+            reason,
+        );
 
         let mut cmd = if self.allow_shell {
             // Dangerous path, opt-in only. The substituted argv elements are
@@ -163,6 +180,7 @@ impl CommandExecutor for ProcessExecutor {
         source_port: u16,
         param: Option<&str>,
         is_new: bool,
+        reason: &str,
     ) -> Result<CommandResult, CommandError> {
         // Bound concurrency; refuse rather than queue unboundedly.
         let _permit = self
@@ -173,7 +191,14 @@ impl CommandExecutor for ProcessExecutor {
 
         let new = if is_new { "1" } else { "0" };
         let mut child = self
-            .build_command(source_ip, client_id, source_port, param.unwrap_or(""), new)
+            .build_command(
+                source_ip,
+                client_id,
+                source_port,
+                param.unwrap_or(""),
+                new,
+                reason,
+            )
             .spawn()
             .map_err(|e| CommandError::Spawn(e.to_string()))?;
 
@@ -207,39 +232,47 @@ mod tests {
     #[test]
     fn substitutes_all_placeholders() {
         assert_eq!(
-            substitute_placeholders("{ip}", ip(), "c1", 5555, "P", "1"),
+            substitute_placeholders("{ip}", ip(), "c1", 5555, "P", "1", "grant"),
             "203.0.113.7"
         );
         assert_eq!(
-            substitute_placeholders("{client_id}", ip(), "c1", 5555, "P", "1"),
+            substitute_placeholders("{client_id}", ip(), "c1", 5555, "P", "1", "grant"),
             "c1"
         );
         assert_eq!(
-            substitute_placeholders("{source_port}", ip(), "c1", 5555, "P", "1"),
+            substitute_placeholders("{source_port}", ip(), "c1", 5555, "P", "1", "grant"),
             "5555"
         );
         assert_eq!(
-            substitute_placeholders("{param}", ip(), "c1", 5555, "deploy-v1", "1"),
+            substitute_placeholders("{param}", ip(), "c1", 5555, "deploy-v1", "1", "grant"),
             "deploy-v1"
         );
         assert_eq!(
-            substitute_placeholders("{new}", ip(), "c1", 5555, "P", "1"),
+            substitute_placeholders("{new}", ip(), "c1", 5555, "P", "1", "grant"),
             "1"
         );
         assert_eq!(
-            substitute_placeholders("{new}", ip(), "c1", 5555, "P", "0"),
+            substitute_placeholders("{new}", ip(), "c1", 5555, "P", "0", "grant"),
             "0"
+        );
+        assert_eq!(
+            substitute_placeholders("{reason}", ip(), "c1", 5555, "P", "0", "bye"),
+            "bye"
+        );
+        assert_eq!(
+            substitute_placeholders("{reason}", ip(), "c1", 5555, "P", "0", "expired"),
+            "expired"
         );
     }
 
     #[test]
     fn leaves_non_placeholder_text_untouched() {
         assert_eq!(
-            substitute_placeholders("--addr={ip}:{source_port}", ip(), "c", 80, "", "0"),
+            substitute_placeholders("--addr={ip}:{source_port}", ip(), "c", 80, "", "0", "grant"),
             "--addr=203.0.113.7:80"
         );
         assert_eq!(
-            substitute_placeholders("/usr/local/sbin/hook", ip(), "c", 80, "", "0"),
+            substitute_placeholders("/usr/local/sbin/hook", ip(), "c", 80, "", "0", "grant"),
             "/usr/local/sbin/hook"
         );
     }
@@ -252,8 +285,9 @@ mod tests {
             "{client_id}".to_string(),
             "{param}".to_string(),
             "{new}".to_string(),
+            "{reason}".to_string(),
         ];
-        let argv = build_argv(&template, ip(), "c1", 5555, "the-param", "1");
+        let argv = build_argv(&template, ip(), "c1", 5555, "the-param", "1", "grant");
         assert_eq!(
             argv,
             vec![
@@ -261,7 +295,8 @@ mod tests {
                 "203.0.113.7",
                 "c1",
                 "the-param",
-                "1"
+                "1",
+                "grant"
             ]
         );
     }
@@ -275,7 +310,7 @@ mod tests {
             "{client_id}".to_string(),
             "{param}".to_string(),
         ];
-        let argv = build_argv(&template, ip(), "x; rm -rf /", 0, "$(reboot)", "0");
+        let argv = build_argv(&template, ip(), "x; rm -rf /", 0, "$(reboot)", "0", "grant");
         assert_eq!(argv[1], "x; rm -rf /");
         assert_eq!(argv[2], "$(reboot)");
     }
@@ -289,7 +324,10 @@ mod tests {
             2,
             false,
         );
-        let res = exec.execute("c", ip(), 1, None, true).await.unwrap();
+        let res = exec
+            .execute("c", ip(), 1, None, true, "grant")
+            .await
+            .unwrap();
         assert_eq!(res.exit_code, Some(0));
         assert!(!res.timed_out);
     }
@@ -303,7 +341,10 @@ mod tests {
             2,
             false,
         );
-        let res = exec.execute("c", ip(), 1, None, false).await.unwrap();
+        let res = exec
+            .execute("c", ip(), 1, None, false, "expired")
+            .await
+            .unwrap();
         assert!(res.timed_out);
     }
 }

@@ -28,6 +28,7 @@ const MAGIC: u8 = 0x5A;
 const TYPE_HELLO: u8 = 0;
 const TYPE_CHALLENGE: u8 = 1;
 const TYPE_RESPONSE: u8 = 2;
+const TYPE_BYE: u8 = 3;
 
 /// Field sizes (bytes).
 pub const CLIENT_ID_LEN: usize = 32;
@@ -128,12 +129,32 @@ pub struct Response {
     pub signature: [u8; SIG_LEN],
 }
 
-/// One of the three packet bodies.
+/// BYE — a RESPONSE-shaped release: the client proves the same single-use nonce
+/// but asks the server to **revoke** its access lease now (clean shutdown)
+/// rather than renew it. Wire layout is identical to [`Response`] (so it can
+/// carry an optional sealed parameter to the revoke hook), but it is signed over
+/// a distinct payload (see [`bye_signing_payload`]) so a captured RESPONSE
+/// cannot be re-framed as a BYE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bye {
+    pub client_id: ClientId,
+    pub nonce: [u8; CHALLENGE_NONCE_LEN],
+    /// Echoed for layout parity with [`Response`]; unused by the server for a
+    /// release (no lease renewal). Covered by the signature.
+    pub interval_seconds: u32,
+    /// Optional sealed parameter for the revoke hook (raw X25519 sealed-box
+    /// bytes, same as [`Response::param`]); `None` if absent.
+    pub param: Option<Vec<u8>>,
+    pub signature: [u8; SIG_LEN],
+}
+
+/// One of the packet bodies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Packet {
     Hello(Hello),
     Challenge(Challenge),
     Response(Response),
+    Bye(Bye),
 }
 
 fn header(packet_type: u8) -> [u8; 2] {
@@ -167,6 +188,16 @@ impl Packet {
                 out.extend_from_slice(&(param.len() as u16).to_le_bytes());
                 out.extend_from_slice(param);
                 out.extend_from_slice(&r.signature);
+            }
+            Packet::Bye(b) => {
+                out.extend_from_slice(&header(TYPE_BYE));
+                out.extend_from_slice(&b.client_id.0);
+                out.extend_from_slice(&b.nonce);
+                out.extend_from_slice(&b.interval_seconds.to_le_bytes());
+                let param = b.param.as_deref().unwrap_or(&[]);
+                out.extend_from_slice(&(param.len() as u16).to_le_bytes());
+                out.extend_from_slice(param);
+                out.extend_from_slice(&b.signature);
             }
         }
         out
@@ -205,6 +236,25 @@ impl Packet {
                 let param_bytes = r.take(param_len)?.to_vec();
                 let signature = r.array::<SIG_LEN>()?;
                 Packet::Response(Response {
+                    client_id,
+                    nonce,
+                    interval_seconds,
+                    param: if param_len == 0 {
+                        None
+                    } else {
+                        Some(param_bytes)
+                    },
+                    signature,
+                })
+            }
+            TYPE_BYE => {
+                let client_id = ClientId(r.array::<CLIENT_ID_LEN>()?);
+                let nonce = r.array::<CHALLENGE_NONCE_LEN>()?;
+                let interval_seconds = r.u32()?;
+                let param_len = r.u16()? as usize;
+                let param_bytes = r.take(param_len)?.to_vec();
+                let signature = r.array::<SIG_LEN>()?;
+                Packet::Bye(Bye {
                     client_id,
                     nonce,
                     interval_seconds,
@@ -301,6 +351,41 @@ pub fn response_signing_payload(
     .into_bytes()
 }
 
+/// Canonical message the client signs in a BYE (lease release). Same fields as
+/// [`response_signing_payload`] (so a BYE can carry a sealed `param` to the
+/// revoke hook) but a distinct header (`:bye` vs `:response`) so a captured
+/// RESPONSE signature can never be replayed/re-framed as a BYE to revoke an
+/// active client — and vice versa.
+///
+/// ```text
+/// signedpulse:v2:bye
+/// server_id=<server_id>
+/// client_id=<client_id_hex>
+/// nonce=<base64_nonce>
+/// interval=<interval_seconds>
+/// expires_at=<expires_at_unix>
+/// param=<base64_ciphertext_or_empty>
+/// ```
+pub fn bye_signing_payload(
+    server_id: &str,
+    client_id_hex: &str,
+    nonce_b64: &str,
+    interval_seconds: u32,
+    expires_at_unix: i64,
+    param_ciphertext_b64: &str,
+) -> Vec<u8> {
+    format!(
+        "{PROTOCOL_NAME}:v{PROTOCOL_VERSION}:bye\n\
+         server_id={server_id}\n\
+         client_id={client_id_hex}\n\
+         nonce={nonce_b64}\n\
+         interval={interval_seconds}\n\
+         expires_at={expires_at_unix}\n\
+         param={param_ciphertext_b64}"
+    )
+    .into_bytes()
+}
+
 /// Canonical message the client signs in a HELLO. `server_id` is included so a
 /// HELLO captured at one server cannot be replayed against a different one.
 ///
@@ -371,6 +456,20 @@ mod tests {
                 interval_seconds: 0,
                 param: None,
                 signature: [6; SIG_LEN],
+            }),
+            Packet::Bye(Bye {
+                client_id: cid(8),
+                nonce: [9; CHALLENGE_NONCE_LEN],
+                interval_seconds: 300,
+                param: Some(vec![5, 6, 7]),
+                signature: [10; SIG_LEN],
+            }),
+            Packet::Bye(Bye {
+                client_id: cid(8),
+                nonce: [9; CHALLENGE_NONCE_LEN],
+                interval_seconds: 0,
+                param: None,
+                signature: [10; SIG_LEN],
             }),
         ] {
             let bytes = packet.encode();
