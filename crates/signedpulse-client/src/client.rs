@@ -377,9 +377,11 @@ impl Pulser {
     }
 
     /// One full HELLO → CHALLENGE → RESPONSE exchange. `max_attempts` bounds the
-    /// retransmits: the daemon and `ping` pass the configured `retries` (SIP
-    /// backoff between attempts); a single-shot `pulse` passes 1. The parameter
-    /// is generated once and reused across retries.
+    /// retransmits: the daemon and `ping` pass the configured `retries`; a
+    /// single-shot `pulse` passes 1. The per-attempt CHALLENGE wait follows the
+    /// SIP backoff `min(retry_initial · 2^(k-1), retry_max)`, so attempt 1 waits
+    /// `retry_initial` (T1) and a 1-attempt `pulse` is the quick single try (not
+    /// the full T2 window). The parameter is generated once and reused.
     async fn run_cycle(&self, max_attempts: u32) -> anyhow::Result<()> {
         let param = self.generate_param().await?;
 
@@ -389,16 +391,12 @@ impl Pulser {
         let attempts = max_attempts.max(1);
         for attempt in 1..=attempts {
             // SIP-style backoff: attempt k waits T1·2^(k-1) for the CHALLENGE,
-            // capped at T2, before retransmitting. A single-shot run (attempts
-            // == 1) waits the full T2 window once rather than only T1.
-            let timeout = if attempts == 1 {
-                self.target.retry_max
-            } else {
-                self.target
-                    .retry_initial
-                    .saturating_mul(1u32 << (attempt - 1).min(31))
-                    .min(self.target.retry_max)
-            };
+            // capped at T2, before retransmitting.
+            let timeout = self
+                .target
+                .retry_initial
+                .saturating_mul(1u32 << (attempt - 1).min(31))
+                .min(self.target.retry_max);
             match self.attempt_once(&socket, param.as_deref(), timeout).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {

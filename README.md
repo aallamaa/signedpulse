@@ -506,9 +506,9 @@ signedpulse-client ping     # same, but retries (SIP backoff) if no reply
 Both run one cycle against every configured server (the `[client]` primary and
 each `[client.servers.*]`), print a per-server `ok` / `FAILED` line, and exit
 non-zero if any server did not respond — so they compose with shell `&&` and
-cron alerting. `pulse` makes exactly one attempt (waiting up to `retry_max_ms`
-for the reply); `ping` makes up to `retries` attempts with the configured
-backoff. (A daemonized client keeps the access lease alive; a periodic `pulse`
+cron alerting. `pulse` makes exactly one attempt (waiting `retry_initial_ms` for
+the reply); `ping` makes up to `retries` attempts with the configured backoff
+(`retry_initial_ms` → ×2 each retry, capped at `retry_max_ms`). (A daemonized client keeps the access lease alive; a periodic `pulse`
 from cron does too, as long as it runs more often than the lease TTL.)
 
 ### Generating a keypair by hand
