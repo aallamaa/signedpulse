@@ -300,6 +300,7 @@ impl Server {
                             exit_code: result.exit_code,
                             timed_out: result.timed_out,
                             param: e.param,
+                            reason: Some("expired".to_string()),
                         });
                     }
                     Err(err) => error!(ip = %e.ip, error = %err, "revoke hook failed"),
@@ -826,6 +827,7 @@ impl Server {
                     exit_code: result.exit_code,
                     timed_out: result.timed_out,
                     param,
+                    reason: Some("grant".to_string()),
                 });
                 if result.timed_out {
                     warn!(%peer, client = %name, "command timed out");
@@ -968,6 +970,7 @@ impl Server {
                     exit_code: result.exit_code,
                     timed_out: result.timed_out,
                     param: revoke_param,
+                    reason: Some("bye".to_string()),
                 });
             }
             Err(err) => error!(ip = %e.ip, error = %err, "revoke hook failed"),

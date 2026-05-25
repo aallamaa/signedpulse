@@ -514,6 +514,7 @@ config:    /etc/signedpulse/server.toml  bind=0.0.0.0:7370  server_id=signedpuls
 pid:       4821   uptime: 2h13m
 last pulse: 203.0.113.7:51456  2m ago
 last hook:  "laptop-1" -> 203.0.113.7  exit 0  2m ago
+last revoke: "phone-2" -> 198.51.100.9  bye  exit 0  40s ago
 counters:  hello=144 verified=140 rejected=4 replays=0 leases=3
 clients:
   laptop-1             203.0.113.7:51456  2m ago

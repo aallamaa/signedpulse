@@ -154,9 +154,11 @@ fn status(config_path: &Path) -> anyhow::Result<()> {
             }
             if let Some(h) = &s.last_revoke {
                 println!(
-                    "last revoke: \"{}\" -> {}  {}  {}",
+                    "last revoke: \"{}\" -> {}  {}  {}  {}",
                     h.client_id,
                     h.source_ip,
+                    // Why it fired: "bye" (client released) vs "expired" (timed out).
+                    h.reason.as_deref().unwrap_or("expired"),
                     if h.timed_out {
                         "timed out".to_string()
                     } else {

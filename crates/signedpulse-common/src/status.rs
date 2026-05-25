@@ -43,6 +43,11 @@ pub struct HookInfo {
     /// Decrypted parameter passed to the hook, if any (local state file only).
     #[serde(default)]
     pub param: Option<String>,
+    /// Why the hook ran: "grant" (verified pulse), "expired" (lease timed out),
+    /// or "bye" (client-initiated release). `None` for status files written by
+    /// older servers.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// Point-in-time view of the server, written on demand.
