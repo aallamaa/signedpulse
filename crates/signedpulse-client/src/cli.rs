@@ -216,6 +216,12 @@ fn init(args: InitArgs, config_path: &std::path::Path) -> anyhow::Result<()> {
         );
     }
 
+    // These are written verbatim into the TOML config; reject break-out chars.
+    validate_token("--server-id", &args.server_id)?;
+    if let Some(label) = &args.label {
+        validate_token("--label", label)?;
+    }
+
     // A fresh random 256-bit client id unless the caller supplied one.
     let client_id = match args.client_id {
         Some(id) => {
@@ -225,6 +231,7 @@ fn init(args: InitArgs, config_path: &std::path::Path) -> anyhow::Result<()> {
         None => ClientId(crypto::Nonce::generate().0).to_hex(),
     };
     let server_addr = normalize_addr(&args.server);
+    validate_addr(&server_addr)?;
     let keys = crypto::generate_keypair();
 
     let mut config = format!(
@@ -235,7 +242,8 @@ fn init(args: InitArgs, config_path: &std::path::Path) -> anyhow::Result<()> {
          server_id = \"{server_id}\"\n\
          interval_seconds = {interval}\n\
          private_key = \"{private_key}\"\n\
-         challenge_timeout_seconds = 5\n\
+         retry_initial_ms = 500\n\
+         retry_max_ms = 4000\n\
          retries = 3\n\
          wire_encryption = {wire_encryption}\n",
         client_id = client_id,
@@ -297,17 +305,9 @@ fn add_server(args: AddServerArgs, config_path: &std::path::Path) -> anyhow::Res
         )
     })?;
 
-    // The label becomes the TOML table key; keep it safe and unambiguous.
+    // The label becomes the TOML table key; keep it a safe bare identifier.
     let name = args.name.as_str();
-    if name.is_empty() {
-        anyhow::bail!("--name must not be empty");
-    }
-    if name
-        .chars()
-        .any(|c| c == '"' || c == '\\' || c.is_control())
-    {
-        anyhow::bail!("--name must not contain quotes, backslashes, or control characters");
-    }
+    validate_token("--name", name)?;
     if name == existing.client.server_id {
         anyhow::bail!("--name {name:?} collides with the primary [client] server_id; pick another");
     }
@@ -315,8 +315,10 @@ fn add_server(args: AddServerArgs, config_path: &std::path::Path) -> anyhow::Res
         anyhow::bail!("server {name:?} is already configured");
     }
     // The wire server_id defaults to the label, but can differ (it must match the
-    // remote server's configured server_id).
+    // remote server's configured server_id). Validate it: it is written verbatim
+    // into a TOML string, so it must not be able to break out of it.
     let server_id = args.server_id.as_deref().unwrap_or(name);
+    validate_token("--server-id", server_id)?;
 
     let wire_encryption = !args.no_encryption;
     if wire_encryption && args.server_key.is_none() {
@@ -330,6 +332,8 @@ fn add_server(args: AddServerArgs, config_path: &std::path::Path) -> anyhow::Res
             .map_err(|e| anyhow::anyhow!("invalid --server-key: {e}"))?;
     }
     let server_addr = normalize_addr(&args.server);
+    // Written verbatim into a TOML string; reject anything that could break out.
+    validate_addr(&server_addr)?;
 
     // Append a `[client.servers.<name>]` table at EOF (always valid TOML; leaves
     // existing content intact). Quote the key if it isn't a bare TOML key.
@@ -383,8 +387,8 @@ fn add_server(args: AddServerArgs, config_path: &std::path::Path) -> anyhow::Res
 }
 
 /// Render a `server_id` as a TOML table-header key: bare when it contains only
-/// `[A-Za-z0-9_-]`, otherwise a quoted key (control chars/quotes are rejected by
-/// the caller, so simple quoting is sufficient here).
+/// `[A-Za-z0-9_-]`, otherwise a quoted key. Callers pass `validate_token`-checked
+/// values, so this is always the bare branch in practice.
 fn toml_table_key(s: &str) -> String {
     if s.chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
@@ -393,6 +397,39 @@ fn toml_table_key(s: &str) -> String {
     } else {
         format!("\"{s}\"")
     }
+}
+
+/// Validate an identifier-like CLI value (label / server_id). These are written
+/// verbatim into TOML basic strings *and* echoed inside shell commands, so we
+/// restrict them to a conservative charset that cannot break out of either —
+/// no quotes, backslashes, `$`, backticks, whitespace, or control characters.
+fn validate_token(field: &str, value: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{field} must not be empty");
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        anyhow::bail!("{field} may only contain ASCII letters, digits, '-', '_', and '.'");
+    }
+    Ok(())
+}
+
+/// Validate a `host[:port]` value before it is written verbatim into a TOML
+/// string. Addresses legitimately contain ':' and '.', so we only forbid what
+/// would let it break out of the string (quotes, backslashes, whitespace, control).
+fn validate_addr(value: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("--server must not be empty");
+    }
+    if value
+        .chars()
+        .any(|c| c == '"' || c == '\\' || c.is_whitespace() || c.is_control())
+    {
+        anyhow::bail!("--server must not contain quotes, backslashes, or whitespace");
+    }
+    Ok(())
 }
 
 fn install_service(args: InstallArgs, config_path: &std::path::Path) -> anyhow::Result<()> {
@@ -503,6 +540,28 @@ mod tests {
     fn normalize_addr_keeps_explicit_port() {
         assert_eq!(normalize_addr("203.0.113.10:9999"), "203.0.113.10:9999");
         assert_eq!(normalize_addr("example.com:5000"), "example.com:5000");
+    }
+
+    #[test]
+    fn validate_token_rejects_toml_and_shell_breakouts() {
+        assert!(validate_token("--server-id", "signedpulse-main").is_ok());
+        assert!(validate_token("--server-id", "sp_B.2").is_ok());
+        assert!(validate_token("--server-id", "").is_err());
+        // Quote/newline would break out of a TOML string; $/backtick are shell-active.
+        assert!(validate_token("--server-id", "x\"\nprivate_key = \"y").is_err());
+        assert!(validate_token("--server-id", "$(reboot)").is_err());
+        assert!(validate_token("--server-id", "a`b`").is_err());
+        assert!(validate_token("--server-id", "has space").is_err());
+    }
+
+    #[test]
+    fn validate_addr_rejects_string_breakouts() {
+        assert!(validate_addr("203.0.113.20:7370").is_ok());
+        assert!(validate_addr("example.com:7370").is_ok());
+        assert!(validate_addr("[2001:db8::1]:7370").is_ok());
+        assert!(validate_addr("x\":1\"\nprivate_key = \"y").is_err());
+        assert!(validate_addr("has space:1").is_err());
+        assert!(validate_addr("").is_err());
     }
 
     #[test]

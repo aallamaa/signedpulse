@@ -37,29 +37,36 @@ pub enum CommandError {
 /// process; tests substitute a mock that records calls.
 #[async_trait]
 pub trait CommandExecutor: Send + Sync {
+    /// Run the hook. `is_new` is `true` when this execution is for a new or
+    /// reactivated session (used for the `{new}` placeholder); the revoke path
+    /// passes `false`.
     async fn execute(
         &self,
         client_id: &str,
         source_ip: IpAddr,
         source_port: u16,
         param: Option<&str>,
+        is_new: bool,
     ) -> Result<CommandResult, CommandError>;
 }
 
 /// Substitute the supported placeholders in a single argv element. Values are
 /// inserted literally; there is no shell or glob interpretation anywhere. The
-/// `param` is the decrypted client-supplied value (empty string when absent).
+/// `param` is the decrypted client-supplied value (empty string when absent);
+/// `new` is `"1"`/`"0"` for the `{new}` flag.
 pub fn substitute_placeholders(
     arg: &str,
     ip: IpAddr,
     client_id: &str,
     source_port: u16,
     param: &str,
+    new: &str,
 ) -> String {
     arg.replace("{ip}", &ip.to_string())
         .replace("{client_id}", client_id)
         .replace("{source_port}", &source_port.to_string())
         .replace("{param}", param)
+        .replace("{new}", new)
 }
 
 /// Build the fully substituted argv from a template.
@@ -69,10 +76,11 @@ pub fn build_argv(
     client_id: &str,
     source_port: u16,
     param: &str,
+    new: &str,
 ) -> Vec<String> {
     template
         .iter()
-        .map(|a| substitute_placeholders(a, ip, client_id, source_port, param))
+        .map(|a| substitute_placeholders(a, ip, client_id, source_port, param, new))
         .collect()
 }
 
@@ -108,8 +116,9 @@ impl ProcessExecutor {
         client_id: &str,
         source_port: u16,
         param: &str,
+        new: &str,
     ) -> tokio::process::Command {
-        let argv = build_argv(&self.argv_template, ip, client_id, source_port, param);
+        let argv = build_argv(&self.argv_template, ip, client_id, source_port, param, new);
 
         let mut cmd = if self.allow_shell {
             // Dangerous path, opt-in only. The substituted argv elements are
@@ -153,6 +162,7 @@ impl CommandExecutor for ProcessExecutor {
         source_ip: IpAddr,
         source_port: u16,
         param: Option<&str>,
+        is_new: bool,
     ) -> Result<CommandResult, CommandError> {
         // Bound concurrency; refuse rather than queue unboundedly.
         let _permit = self
@@ -161,8 +171,9 @@ impl CommandExecutor for ProcessExecutor {
             .try_acquire_owned()
             .map_err(|_| CommandError::AtCapacity)?;
 
+        let new = if is_new { "1" } else { "0" };
         let mut child = self
-            .build_command(source_ip, client_id, source_port, param.unwrap_or(""))
+            .build_command(source_ip, client_id, source_port, param.unwrap_or(""), new)
             .spawn()
             .map_err(|e| CommandError::Spawn(e.to_string()))?;
 
@@ -196,31 +207,39 @@ mod tests {
     #[test]
     fn substitutes_all_placeholders() {
         assert_eq!(
-            substitute_placeholders("{ip}", ip(), "c1", 5555, "P"),
+            substitute_placeholders("{ip}", ip(), "c1", 5555, "P", "1"),
             "203.0.113.7"
         );
         assert_eq!(
-            substitute_placeholders("{client_id}", ip(), "c1", 5555, "P"),
+            substitute_placeholders("{client_id}", ip(), "c1", 5555, "P", "1"),
             "c1"
         );
         assert_eq!(
-            substitute_placeholders("{source_port}", ip(), "c1", 5555, "P"),
+            substitute_placeholders("{source_port}", ip(), "c1", 5555, "P", "1"),
             "5555"
         );
         assert_eq!(
-            substitute_placeholders("{param}", ip(), "c1", 5555, "deploy-v1"),
+            substitute_placeholders("{param}", ip(), "c1", 5555, "deploy-v1", "1"),
             "deploy-v1"
+        );
+        assert_eq!(
+            substitute_placeholders("{new}", ip(), "c1", 5555, "P", "1"),
+            "1"
+        );
+        assert_eq!(
+            substitute_placeholders("{new}", ip(), "c1", 5555, "P", "0"),
+            "0"
         );
     }
 
     #[test]
     fn leaves_non_placeholder_text_untouched() {
         assert_eq!(
-            substitute_placeholders("--addr={ip}:{source_port}", ip(), "c", 80, ""),
+            substitute_placeholders("--addr={ip}:{source_port}", ip(), "c", 80, "", "0"),
             "--addr=203.0.113.7:80"
         );
         assert_eq!(
-            substitute_placeholders("/usr/local/sbin/hook", ip(), "c", 80, ""),
+            substitute_placeholders("/usr/local/sbin/hook", ip(), "c", 80, "", "0"),
             "/usr/local/sbin/hook"
         );
     }
@@ -232,15 +251,17 @@ mod tests {
             "{ip}".to_string(),
             "{client_id}".to_string(),
             "{param}".to_string(),
+            "{new}".to_string(),
         ];
-        let argv = build_argv(&template, ip(), "c1", 5555, "the-param");
+        let argv = build_argv(&template, ip(), "c1", 5555, "the-param", "1");
         assert_eq!(
             argv,
             vec![
                 "/usr/local/sbin/signedpulse-hook",
                 "203.0.113.7",
                 "c1",
-                "the-param"
+                "the-param",
+                "1"
             ]
         );
     }
@@ -254,7 +275,7 @@ mod tests {
             "{client_id}".to_string(),
             "{param}".to_string(),
         ];
-        let argv = build_argv(&template, ip(), "x; rm -rf /", 0, "$(reboot)");
+        let argv = build_argv(&template, ip(), "x; rm -rf /", 0, "$(reboot)", "0");
         assert_eq!(argv[1], "x; rm -rf /");
         assert_eq!(argv[2], "$(reboot)");
     }
@@ -268,7 +289,7 @@ mod tests {
             2,
             false,
         );
-        let res = exec.execute("c", ip(), 1, None).await.unwrap();
+        let res = exec.execute("c", ip(), 1, None, true).await.unwrap();
         assert_eq!(res.exit_code, Some(0));
         assert!(!res.timed_out);
     }
@@ -282,7 +303,7 @@ mod tests {
             2,
             false,
         );
-        let res = exec.execute("c", ip(), 1, None).await.unwrap();
+        let res = exec.execute("c", ip(), 1, None, false).await.unwrap();
         assert!(res.timed_out);
     }
 }

@@ -12,8 +12,12 @@ server_id = "signedpulse-main"
 interval_seconds = 300
 # Base64 Ed25519 private key seed. KEEP SECRET.
 private_key = "REPLACE_WITH_BASE64_ED25519_PRIVATE_KEY"
-challenge_timeout_seconds = 5
+# SIP-style retry backoff: attempt k waits min(retry_initial_ms × 2^(k-1),
+# retry_max_ms) for the CHALLENGE before retransmitting.
+retry_initial_ms = 500
+retry_max_ms = 4000
 retries = 3
+# (challenge_timeout_seconds is deprecated and ignored; superseded by the above.)
 # Seal every datagram to the server (default). Must match server wire_encryption.
 wire_encryption = true
 # Server's base64 X25519 public key (printed by `signedpulse-server init`).

@@ -41,6 +41,10 @@ wire_encryption = "required"
 encryption_private_key = "REPLACE_WITH_BASE64_X25519_SECRET"
 # Maximum decrypted parameter length in bytes.
 max_param_len = 256
+# Access-lease TTL = the client's advertised pulse interval × this (default 3,
+# i.e. revoke after ~3 missed pulses). Capped by lease_max_seconds.
+# lease_grace_multiplier = 3
+# lease_max_seconds = 86400
 
 [command]
 # argv array. Placeholders are substituted as literal arguments (no shell):
@@ -48,7 +52,14 @@ max_param_len = 256
 #   {client_id}   -> verified client id (hex)
 #   {source_port} -> source UDP port from the packet metadata
 #   {param}       -> the decrypted client-supplied parameter (if any)
-argv = ["/usr/local/sbin/signedpulse-hook", "{ip}", "{client_id}", "{param}"]
+#   {new}         -> "1" on a new/reactivated session (first pulse, or first
+#                    after the access lease expired), "0" on a keep-alive renewal
+argv = ["/usr/local/sbin/signedpulse-hook", "grant", "{ip}", "{client_id}", "{new}"]
+# Optional REVOKE hook: runs when a source IP stops pulsing for the lease TTL,
+# closing what `argv` opened. Same placeholders ({new} is always "0" here);
+# reuses working_dir/max_concurrent/allow_shell/command_timeout. Make it
+# IDEMPOTENT. Omit to leave access open once granted (the original behavior).
+# revoke_argv = ["/usr/local/sbin/signedpulse-hook", "revoke", "{ip}", "{client_id}"]
 working_dir = "/"
 max_concurrent = 4
 allow_shell = false                # DANGEROUS if true; keep false

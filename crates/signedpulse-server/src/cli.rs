@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::command_runner::ProcessExecutor;
+use crate::command_runner::{CommandExecutor, ProcessExecutor};
 use crate::server::Server;
 use clap::{Parser, Subcommand};
 use signedpulse_common::config::ServerConfig;
@@ -152,9 +152,27 @@ fn status(config_path: &Path) -> anyhow::Result<()> {
                 ),
                 None => println!("last hook:  none yet"),
             }
+            if let Some(h) = &s.last_revoke {
+                println!(
+                    "last revoke: {} -> {}  {}  {}",
+                    h.client_id,
+                    h.source_ip,
+                    if h.timed_out {
+                        "timed out".to_string()
+                    } else {
+                        format!(
+                            "exit {}",
+                            h.exit_code
+                                .map(|c| c.to_string())
+                                .unwrap_or_else(|| "?".into())
+                        )
+                    },
+                    status::ago(h.at_unix)
+                );
+            }
             println!(
-                "counters:  hello={} verified={} rejected={} replays={}",
-                s.hello_accepted, s.verified, s.rejected, s.replays
+                "counters:  hello={} verified={} rejected={} replays={} leases={}",
+                s.hello_accepted, s.verified, s.rejected, s.replays, s.active_leases
             );
             if !s.clients.is_empty() {
                 println!("clients:");
@@ -186,6 +204,18 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         config.command.allow_shell,
     ));
 
+    // Optional revoke hook: a second executor sharing the command settings.
+    let revoke_executor: Option<Arc<dyn CommandExecutor>> =
+        config.command.revoke_argv.as_ref().map(|argv| {
+            Arc::new(ProcessExecutor::new(
+                argv.clone(),
+                config.command.working_dir.clone(),
+                Duration::from_secs(config.server.command_timeout_seconds),
+                config.command.max_concurrent,
+                config.command.allow_shell,
+            )) as Arc<dyn CommandExecutor>
+        });
+
     if config.command.allow_shell {
         // Loud warning: with a shell, the client-supplied {param} (and {ip}) are
         // concatenated into the `sh -c` string, so a single authorized — or
@@ -202,7 +232,7 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
     let bind_addr = config.server.bind.clone();
     let socket = UdpSocket::bind(&bind_addr).await?;
 
-    let server = Arc::new(Server::from_config(config, executor)?);
+    let server = Arc::new(Server::from_config(config, executor, revoke_executor)?);
 
     // Graceful shutdown on Ctrl-C / SIGTERM.
     let shutdown = async {
@@ -236,6 +266,9 @@ fn init(args: InitArgs, config_path: &Path) -> anyhow::Result<()> {
             config_path.display()
         );
     }
+    // server_id is written into the TOML config AND echoed inside the client
+    // setup commands we print; restrict it so it can't break out of either.
+    validate_token("--server-id", &args.server_id)?;
 
     // Generate the X25519 keypair for packet/param decryption.
     let (enc_secret_b64, enc_public_b64) = crypto::generate_encryption_keypair();
@@ -316,6 +349,23 @@ fn init(args: InitArgs, config_path: &Path) -> anyhow::Result<()> {
     println!(
         "Next: authorize clients with `signedpulse-server add-client`, then start the server."
     );
+    Ok(())
+}
+
+/// Validate an identifier-like value (server_id) that is written verbatim into
+/// the TOML config and echoed inside the printed client commands. Restricting it
+/// to a conservative charset means it cannot break out of a TOML string or a
+/// shell argument.
+fn validate_token(field: &str, value: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{field} must not be empty");
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        anyhow::bail!("{field} may only contain ASCII letters, digits, '-', '_', and '.'");
+    }
     Ok(())
 }
 

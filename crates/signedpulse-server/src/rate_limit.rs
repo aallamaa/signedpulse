@@ -428,6 +428,150 @@ impl ActiveIps {
     }
 }
 
+/// One active access lease, keyed by source IP. Renewed on every verified pulse;
+/// when it expires (no pulse for the TTL) the server runs the revoke hook.
+struct Lease {
+    expires_at: Instant,
+    client_id: String,
+    source_port: u16,
+    param: Option<String>,
+}
+
+/// A lease that expired this sweep — the data the revoke hook needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpiredLease {
+    pub ip: IpAddr,
+    pub client_id: String,
+    pub source_port: u16,
+    pub param: Option<String>,
+}
+
+/// Per-source-IP access leases for the port-knock "access while pulsing" model.
+/// A verified pulse renews the IP's lease (with a TTL derived from the client's
+/// advertised interval); when an IP stops pulsing the lease expires and the
+/// caller runs the revoke hook. Always populated (independent of whether a
+/// revoke hook is configured) so the server can also tell the GRANT hook whether
+/// a pulse is a new/reactivated session (`renew` returns that). Keyed by IP so a
+/// NAT'd address shared by clients stays open while any of them pulses.
+pub struct LeaseTracker {
+    max_entries: usize,
+    leases: Mutex<HashMap<IpAddr, Lease>>,
+}
+
+impl LeaseTracker {
+    pub fn new(max_entries: usize) -> Self {
+        LeaseTracker {
+            max_entries: max_entries.max(1),
+            leases: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Create or renew the lease for `ip`, with `ttl` from now. Returns `true`
+    /// when this is a NEW or reactivated session — i.e. there was no live lease
+    /// for the IP immediately before (first pulse ever, or the first after the
+    /// previous lease expired) — and `false` when it merely renews a live lease.
+    /// Only reachable post-signature-verification, so unspoofable; a genuinely
+    /// new IP is gated by `max_entries` (refused when full, like `ActiveIps`).
+    pub fn renew(
+        &self,
+        ip: IpAddr,
+        client_id: &str,
+        source_port: u16,
+        param: Option<&str>,
+        ttl: Duration,
+    ) -> bool {
+        self.renew_at(ip, client_id, source_port, param, ttl, Instant::now())
+    }
+
+    fn renew_at(
+        &self,
+        ip: IpAddr,
+        client_id: &str,
+        source_port: u16,
+        param: Option<&str>,
+        ttl: Duration,
+        now: Instant,
+    ) -> bool {
+        let mut leases = self.leases.lock().unwrap();
+        // A live (non-expired) lease for this IP means it's a renewal; an absent
+        // or already-expired entry means a new/reactivated session.
+        let is_new = match leases.get(&ip) {
+            Some(l) => now >= l.expires_at,
+            None => true,
+        };
+        let lease = Lease {
+            expires_at: now + ttl,
+            client_id: client_id.to_string(),
+            source_port,
+            param: param.map(|s| s.to_string()),
+        };
+        // Refresh an existing IP freely; only a genuinely new IP is gated by the
+        // cap. At true saturation (max_entries distinct LIVE leases) a new IP is
+        // refused tracking: the grant hook still runs (access works) but the IP
+        // won't be auto-revoked since no lease is stored. We do NOT evict expired
+        // entries here — they must go through `take_expired` to fire their revoke
+        // hook; the 5s sweep reclaims those slots, so this only bites at genuine
+        // saturation by live leases. `is_new` is still returned true for a
+        // refused IP so the grant hook treats it as a fresh session.
+        if leases.contains_key(&ip) || leases.len() < self.max_entries {
+            leases.insert(ip, lease);
+        }
+        is_new
+    }
+
+    /// Whether `ip` currently holds a non-expired lease. Used by the revoke sweep
+    /// to skip an IP that re-pulsed (and got a fresh lease) since it expired,
+    /// avoiding a stale revoke tearing down access a concurrent grant re-opened.
+    pub fn is_live(&self, ip: IpAddr) -> bool {
+        self.is_live_at(ip, Instant::now())
+    }
+
+    fn is_live_at(&self, ip: IpAddr, now: Instant) -> bool {
+        self.leases
+            .lock()
+            .unwrap()
+            .get(&ip)
+            .is_some_and(|l| now < l.expires_at)
+    }
+
+    /// Remove and return every lease that has expired, so the caller can run the
+    /// revoke hook for each. Drains under a single lock; the lock is released
+    /// before the caller spawns any revoke work.
+    pub fn take_expired(&self) -> Vec<ExpiredLease> {
+        self.take_expired_at(Instant::now())
+    }
+
+    fn take_expired_at(&self, now: Instant) -> Vec<ExpiredLease> {
+        let mut leases = self.leases.lock().unwrap();
+        let mut expired = Vec::new();
+        leases.retain(|ip, l| {
+            if now >= l.expires_at {
+                expired.push(ExpiredLease {
+                    ip: *ip,
+                    client_id: l.client_id.clone(),
+                    source_port: l.source_port,
+                    param: l.param.clone(),
+                });
+                false
+            } else {
+                true
+            }
+        });
+        expired
+    }
+
+    /// Count of live (non-expired) leases, for status.
+    pub fn active_count(&self) -> usize {
+        let now = Instant::now();
+        self.leases
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|l| now < l.expires_at)
+            .count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +580,67 @@ mod tests {
 
     fn ip(n: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(192, 0, 2, n))
+    }
+
+    #[test]
+    fn lease_renews_reactivates_and_expires() {
+        let lt = LeaseTracker::new(1024);
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(10);
+        // First pulse is a new session.
+        assert!(lt.renew_at(ip(1), "cid", 5, None, ttl, t0));
+        assert_eq!(lt.take_expired_at(t0).len(), 0);
+        // Renewal within TTL is not "new" and pushes expiry out.
+        assert!(!lt.renew_at(ip(1), "cid", 5, None, ttl, t0 + Duration::from_secs(5)));
+        assert_eq!(
+            lt.take_expired_at(t0 + Duration::from_secs(11)).len(),
+            0,
+            "renewal should have pushed expiry past t0+11"
+        );
+        // After it finally expires, take_expired drains it once.
+        let expired = lt.take_expired_at(t0 + Duration::from_secs(100));
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].ip, ip(1));
+        // A pulse after expiry is a new/reactivated session again.
+        assert!(lt.renew_at(ip(1), "cid", 5, None, ttl, t0 + Duration::from_secs(101)));
+    }
+
+    #[test]
+    fn lease_is_live_tracks_expiry() {
+        let lt = LeaseTracker::new(1024);
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(10);
+        assert!(!lt.is_live_at(ip(1), t0), "no lease yet");
+        lt.renew_at(ip(1), "c", 1, None, ttl, t0);
+        assert!(
+            lt.is_live_at(ip(1), t0 + Duration::from_secs(5)),
+            "within ttl"
+        );
+        assert!(
+            !lt.is_live_at(ip(1), t0 + Duration::from_secs(11)),
+            "past ttl"
+        );
+    }
+
+    #[test]
+    fn lease_records_latest_client_and_caps() {
+        let lt = LeaseTracker::new(2);
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(10);
+        lt.renew_at(ip(1), "alice", 1, Some("a"), ttl, t0);
+        lt.renew_at(ip(1), "bob", 2, Some("b"), ttl, t0); // overwrite same IP
+        lt.renew_at(ip(2), "carol", 3, None, ttl, t0);
+        // Table is full (2); a third distinct IP is refused tracking.
+        lt.renew_at(ip(3), "dave", 4, None, ttl, t0);
+        assert_eq!(lt.active_count(), 2);
+        let mut expired = lt.take_expired_at(t0 + Duration::from_secs(11));
+        expired.sort_by_key(|e| e.ip);
+        assert_eq!(expired.len(), 2);
+        // ip(1) carries the latest renewer (bob/port2/param b).
+        let one = expired.iter().find(|e| e.ip == ip(1)).unwrap();
+        assert_eq!(one.client_id, "bob");
+        assert_eq!(one.source_port, 2);
+        assert_eq!(one.param.as_deref(), Some("b"));
     }
 
     #[test]

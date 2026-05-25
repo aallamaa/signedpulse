@@ -23,6 +23,7 @@ pub mod testing {
         pub source_ip: IpAddr,
         pub source_port: u16,
         pub param: Option<String>,
+        pub is_new: bool,
     }
 
     /// A `CommandExecutor` that records its calls instead of running anything.
@@ -54,12 +55,14 @@ pub mod testing {
             source_ip: IpAddr,
             source_port: u16,
             param: Option<&str>,
+            is_new: bool,
         ) -> Result<CommandResult, CommandError> {
             self.executions.lock().unwrap().push(Execution {
                 client_id: client_id.to_string(),
                 source_ip,
                 source_port,
                 param: param.map(|s| s.to_string()),
+                is_new,
             });
             Ok(CommandResult {
                 exit_code: Some(0),

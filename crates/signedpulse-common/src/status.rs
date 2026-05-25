@@ -49,6 +49,12 @@ pub struct ServerStatusSnapshot {
     pub replays: u64,
     pub last_pulse: Option<PulseInfo>,
     pub last_hook: Option<HookInfo>,
+    /// Live access leases currently held (source IPs allowed while pulsing).
+    #[serde(default)]
+    pub active_leases: usize,
+    /// Last REVOKE hook run when an access lease expired.
+    #[serde(default)]
+    pub last_revoke: Option<HookInfo>,
     /// Last verified pulse per client_id.
     pub clients: BTreeMap<String, PulseInfo>,
 }

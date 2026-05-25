@@ -451,7 +451,7 @@ mod tests {
         let keys = generate_keypair();
         let sk = load_signing_key(&keys.private_key_b64).unwrap();
         let vk = load_verifying_key(&keys.public_key_b64).unwrap();
-        let payload = response_signing_payload("s1", "c1", "bm9uY2U=", 1234, "");
+        let payload = response_signing_payload("s1", "c1", "bm9uY2U=", 300, 1234, "");
         let sig = sign_payload(&sk, &payload);
         assert!(verify_payload(&vk, &payload, &sig).is_ok());
     }

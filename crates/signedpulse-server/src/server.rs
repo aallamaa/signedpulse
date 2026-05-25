@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::command_runner::CommandExecutor;
 use crate::nonce_store::{now_unix, ConsumeError, NonceStore};
-use crate::rate_limit::{ActiveIps, Blacklist, CooldownTracker, HelloRateLimiter};
+use crate::rate_limit::{ActiveIps, Blacklist, CooldownTracker, HelloRateLimiter, LeaseTracker};
 use crate::seen_cache::SeenCache;
 
 /// Per-client state derived from config.
@@ -105,6 +105,11 @@ pub struct Server {
     /// True while we are in attack-lockdown (so the transition is logged once).
     lockdown_logged: AtomicBool,
     executor: Arc<dyn CommandExecutor>,
+    /// Optional REVOKE executor; `None` when no `command.revoke_argv` is set.
+    revoke_executor: Option<Arc<dyn CommandExecutor>>,
+    /// Per-source-IP access leases (renewed by each verified pulse; expiry runs
+    /// the revoke hook). Always tracked so the grant hook can be told `{new}`.
+    leases: Arc<LeaseTracker>,
     /// Live status snapshot, dumped to `state_path` on demand (SIGUSR1).
     status: Arc<Mutex<ServerStatusSnapshot>>,
     state_path: PathBuf,
@@ -117,6 +122,7 @@ impl Server {
     pub fn from_config(
         config: ServerConfig,
         executor: Arc<dyn CommandExecutor>,
+        revoke_executor: Option<Arc<dyn CommandExecutor>>,
     ) -> anyhow::Result<Self> {
         let mut clients = HashMap::new();
         for c in &config.clients {
@@ -162,6 +168,7 @@ impl Server {
             s.max_tracked_ips,
         ));
         let active_ips = Arc::new(ActiveIps::new(s.active_ip_ttl_seconds, s.max_tracked_ips));
+        let leases = Arc::new(LeaseTracker::new(s.max_tracked_ips));
 
         let state_path = s
             .state_file
@@ -185,6 +192,8 @@ impl Server {
             active_ips,
             lockdown_logged: AtomicBool::new(false),
             executor,
+            revoke_executor,
+            leases,
             status,
             state_path,
             config,
@@ -198,10 +207,70 @@ impl Server {
     /// Serialize the current live status to the state file. Called on SIGUSR1
     /// and directly from tests. Errors are logged, not fatal.
     pub fn write_status(&self) {
-        let snapshot = self.status.lock().unwrap().clone();
+        let mut snapshot = self.status.lock().unwrap().clone();
+        snapshot.active_leases = self.leases.active_count();
         if let Err(e) = status::write_snapshot(&self.state_path, &snapshot) {
             warn!(path = %self.state_path.display(), error = %e, "failed to write status file");
         }
+    }
+
+    /// Sweep expired access leases and run the revoke hook for each. Called every
+    /// cleanup tick (and directly from tests). Always drains the expired entries
+    /// (so the map stays bounded and `{new}` stays accurate); runs the revoke
+    /// hook only when one is configured.
+    ///
+    /// The expired leases are processed in a SINGLE spawned task, sequentially
+    /// (one revoke in flight at a time), so within a tick the executor's
+    /// `try_acquire` capacity is never exceeded and no revoke is lost to
+    /// `AtCapacity`. (Edge case: if a revoke hook runs longer than the 5s tick,
+    /// the next tick's batch can overlap this one; with `command.max_concurrent`
+    /// revokes already in flight a further revoke would get `AtCapacity` and be
+    /// dropped — that IP then stays open until it re-pulses and re-expires. This
+    /// needs a revoke hook slower than the tick AND the concurrency cap reached,
+    /// and is self-healing.) Before each revoke we re-check that the IP has not
+    /// re-pulsed in the meantime — if a fresh lease now exists, a concurrent
+    /// grant re-opened access and we must NOT revoke it.
+    pub fn run_lease_scan(self: &Arc<Self>) {
+        let expired = self.leases.take_expired();
+        let Some(revoke) = self.revoke_executor.clone() else {
+            return;
+        };
+        if expired.is_empty() {
+            return;
+        }
+        let leases = self.leases.clone();
+        let status = self.status.clone();
+        tokio::spawn(async move {
+            for e in expired {
+                // The IP re-pulsed and holds a fresh lease again — skip the stale
+                // revoke so we don't tear down access a new grant just re-opened.
+                if leases.is_live(e.ip) {
+                    continue;
+                }
+                match revoke
+                    .execute(&e.client_id, e.ip, e.source_port, e.param.as_deref(), false)
+                    .await
+                {
+                    Ok(result) => {
+                        if result.timed_out {
+                            warn!(ip = %e.ip, "revoke hook timed out");
+                        } else {
+                            info!(ip = %e.ip, client_id = %e.client_id, exit_code = ?result.exit_code, "lease expired; access revoked");
+                        }
+                        let mut s = status.lock().unwrap();
+                        s.last_revoke = Some(HookInfo {
+                            client_id: e.client_id,
+                            source_ip: e.ip,
+                            at_unix: now_unix(),
+                            exit_code: result.exit_code,
+                            timed_out: result.timed_out,
+                            param: e.param,
+                        });
+                    }
+                    Err(err) => error!(ip = %e.ip, error = %err, "revoke hook failed"),
+                }
+            }
+        });
     }
 
     /// Count a rejected packet (validation/auth failure). Does NOT touch the
@@ -258,26 +327,23 @@ impl Server {
         // Background task: purge expired nonces, stale rate-limit windows, and
         // expired blacklist entries.
         let cleanup = {
-            let nonce_store = self.nonce_store.clone();
-            let seen_hellos = self.seen_hellos.clone();
-            let rate_limiter = self.rate_limiter.clone();
-            let blacklist = self.blacklist.clone();
-            let active_ips = self.active_ips.clone();
-            let cooldown = self.cooldown.clone();
+            let server = Arc::clone(&self);
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_secs(5));
                 loop {
                     tick.tick().await;
                     let now = now_unix();
-                    let removed = nonce_store.purge_expired(now);
+                    let removed = server.nonce_store.purge_expired(now);
                     if removed > 0 {
                         debug!(removed, "purged expired nonces");
                     }
-                    seen_hellos.purge_expired(now);
-                    rate_limiter.purge_stale();
-                    blacklist.purge_stale();
-                    active_ips.purge_stale();
-                    cooldown.purge_stale();
+                    server.seen_hellos.purge_expired(now);
+                    server.rate_limiter.purge_stale();
+                    server.blacklist.purge_stale();
+                    server.active_ips.purge_stale();
+                    server.cooldown.purge_stale();
+                    // Revoke access for IPs whose lease expired this tick.
+                    server.run_lease_scan();
                 }
             })
         };
@@ -574,6 +640,7 @@ impl Server {
                     &self.config.server.server_id,
                     &client_hex,
                     &B64.encode(resp.nonce),
+                    resp.interval_seconds,
                     0,
                     &param_b64,
                 );
@@ -618,6 +685,7 @@ impl Server {
             &self.config.server.server_id,
             &client_hex,
             &B64.encode(resp.nonce),
+            resp.interval_seconds,
             entry.expires_at_unix,
             &param_b64,
         );
@@ -662,22 +730,53 @@ impl Server {
             s.clients.insert(name.clone(), pulse);
         }
 
-        // 5. Cooldown (per client_id and per source IP).
+        // 5. Renew the access lease on EVERY verified pulse — even if the cooldown
+        //    below skips the grant hook — so the IP stays authorized while it keeps
+        //    pulsing. The TTL is derived from the client's advertised interval, so
+        //    the server knows when to expect the next pulse. `is_new` is true when
+        //    there was no live lease (first pulse, or first after a prior expiry):
+        //    a new/reactivated session, surfaced to the grant hook as `{new}`.
+        let lease_ttl = {
+            let s = &self.config.server;
+            let secs = (resp.interval_seconds as u64)
+                .saturating_mul(s.lease_grace_multiplier as u64)
+                .clamp(1, s.lease_max_seconds);
+            Duration::from_secs(secs)
+        };
+        let is_new = self.leases.renew(
+            peer.ip(),
+            &client_hex,
+            peer.port(),
+            param.as_deref(),
+            lease_ttl,
+        );
+
+        // 6. Cooldown (per client_id and per source IP). A new/reactivated
+        //    session (is_new) always (re)runs the grant hook so access is
+        //    (re)opened even within the cooldown window — otherwise a client
+        //    whose lease just expired (pinhole revoked) and resumed could be left
+        //    with a live lease but a closed pinhole until cooldown lapsed.
         let ip_key = format!("ip:{}", peer.ip());
         let id_key = format!("id:{client_hex}");
-        if self.cooldown.in_cooldown(&id_key) || self.cooldown.in_cooldown(&ip_key) {
+        if !is_new && (self.cooldown.in_cooldown(&id_key) || self.cooldown.in_cooldown(&ip_key)) {
             info!(%peer, client = %name, "within cooldown; skipping command execution");
             return;
         }
 
-        // 6. Execute the hook with the source IP from packet metadata. The hook
-        //    receives the canonical 64-hex client id (not the human label), so
-        //    {client_id} is the verified identity an attacker cannot shape.
+        // 7. Execute the grant hook with the source IP from packet metadata. The
+        //    hook receives the canonical 64-hex client id (not the human label),
+        //    so {client_id} is the verified identity an attacker cannot shape.
         let source_ip = peer.ip();
         let source_port = peer.port();
         match self
             .executor
-            .execute(&client_hex, source_ip, source_port, param.as_deref())
+            .execute(
+                &client_hex,
+                source_ip,
+                source_port,
+                param.as_deref(),
+                is_new,
+            )
             .await
         {
             Ok(result) => {

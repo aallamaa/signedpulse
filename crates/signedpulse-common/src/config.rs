@@ -104,13 +104,23 @@ pub struct ServerSection {
     #[serde(default = "default_max_inflight_packets")]
     pub max_inflight_packets: usize,
     /// Hard cap on distinct source IPs tracked in the bounded maps: the
-    /// blacklist, the per-IP HELLO rate limiter, and the lockdown active-IP
-    /// allow-list. When full, new IPs are refused tracking rather than evicting.
-    /// (The nonce store and HELLO replay cache are not capped by this value;
-    /// they are bounded by their TTL and grow only via signature-authenticated
-    /// HELLOs, so a pure source-spoofer cannot inflate them.)
+    /// blacklist, the per-IP HELLO rate limiter, the lockdown active-IP
+    /// allow-list, and the access leases. When full, new IPs are refused
+    /// tracking rather than evicting. (The nonce store and HELLO replay cache
+    /// are not capped by this value; they are bounded by their TTL and grow only
+    /// via signature-authenticated HELLOs, so a pure source-spoofer cannot
+    /// inflate them.)
     #[serde(default = "default_max_tracked_ips")]
     pub max_tracked_ips: usize,
+    /// Access-lease TTL = the client's advertised pulse interval × this. With
+    /// the default 3, an IP's access is revoked after ~3 missed pulses of
+    /// silence. Must be >= 1.
+    #[serde(default = "default_lease_grace_multiplier")]
+    pub lease_grace_multiplier: u32,
+    /// Upper bound (seconds) on a derived lease TTL, so a client advertising a
+    /// huge interval cannot hold access open indefinitely. Must be >= 1.
+    #[serde(default = "default_lease_max_seconds")]
+    pub lease_max_seconds: u64,
 }
 
 /// Whether the server requires sealed datagrams or speaks cleartext binary.
@@ -126,9 +136,19 @@ pub enum WireEncryption {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandSection {
-    /// Argv array. Placeholders `{ip}`, `{client_id}`, `{source_port}` are
-    /// substituted safely before execution — never via a shell.
+    /// GRANT argv, run on each verified pulse. Placeholders `{ip}`,
+    /// `{client_id}`, `{source_port}`, `{param}`, `{new}` are substituted safely
+    /// before execution — never via a shell. `{new}` is `1` on a new/reactivated
+    /// session (first pulse, or the first after the access lease expired) and `0`
+    /// on a keep-alive renewal.
     pub argv: Vec<String>,
+    /// Optional REVOKE argv, run when a source IP stops pulsing for the lease
+    /// TTL (≈ the client's advertised interval × `server.lease_grace_multiplier`).
+    /// Same placeholders as `argv` (`{new}` is always `0` here). Reuses
+    /// `working_dir`/`max_concurrent`/`allow_shell` and `command_timeout_seconds`.
+    /// Unset = no auto-revoke (access stays open once granted).
+    #[serde(default)]
+    pub revoke_argv: Option<Vec<String>>,
     #[serde(default)]
     pub working_dir: Option<String>,
     #[serde(default = "default_max_concurrent")]
@@ -205,6 +225,12 @@ fn default_max_inflight_packets() -> usize {
 fn default_max_tracked_ips() -> usize {
     100_000
 }
+fn default_lease_grace_multiplier() -> u32 {
+    3
+}
+fn default_lease_max_seconds() -> u64 {
+    86_400
+}
 
 impl ServerConfig {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
@@ -229,6 +255,28 @@ impl ServerConfig {
         if self.command.max_concurrent == 0 {
             return Err(ConfigError::Invalid(
                 "command.max_concurrent must be >= 1".into(),
+            ));
+        }
+        // The revoke hook, when present, must be a real command.
+        if let Some(revoke) = &self.command.revoke_argv {
+            if revoke.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "command.revoke_argv must contain at least the program path \
+                     (omit it entirely to disable auto-revoke)"
+                        .into(),
+                ));
+            }
+        }
+        if self.server.lease_grace_multiplier == 0 {
+            return Err(ConfigError::Invalid(
+                "server.lease_grace_multiplier must be >= 1".into(),
+            ));
+        }
+        // Bounded above so a derived lease TTL can never overflow `Instant + Duration`
+        // (one year is far longer than any "access while pulsing" lease).
+        if self.server.lease_max_seconds == 0 || self.server.lease_max_seconds > 31_536_000 {
+            return Err(ConfigError::Invalid(
+                "server.lease_max_seconds must be between 1 and 31536000 (1 year)".into(),
             ));
         }
         // A UDP payload can't exceed ~64 KiB; bound it so the receive buffer
@@ -318,8 +366,18 @@ pub struct ClientSection {
     pub interval_seconds: u64,
     /// Base64-encoded Ed25519 private key seed. Sensitive.
     pub private_key: String,
+    /// Deprecated: no longer governs retry timing (superseded by
+    /// `retry_initial_ms`/`retry_max_ms`). Still accepted so existing configs
+    /// keep loading; otherwise ignored.
     #[serde(default = "default_challenge_timeout")]
     pub challenge_timeout_seconds: u64,
+    /// SIP-style retry backoff: attempt k waits min(retry_initial_ms × 2^(k-1),
+    /// retry_max_ms) for the CHALLENGE before retransmitting. T1.
+    #[serde(default = "default_retry_initial_ms")]
+    pub retry_initial_ms: u64,
+    /// Cap (T2) on the per-attempt backoff above.
+    #[serde(default = "default_retry_max_ms")]
+    pub retry_max_ms: u64,
     #[serde(default = "default_retries")]
     pub retries: u32,
     /// Optional override for the on-demand status state file. Defaults to a path
@@ -383,9 +441,15 @@ pub struct ServerOverride {
     /// Override `[client].interval_seconds` for this server.
     #[serde(default)]
     pub interval_seconds: Option<u64>,
-    /// Override `[client].challenge_timeout_seconds` for this server.
+    /// Deprecated (ignored), accepted for backward compatibility.
     #[serde(default)]
     pub challenge_timeout_seconds: Option<u64>,
+    /// Override `[client].retry_initial_ms` for this server.
+    #[serde(default)]
+    pub retry_initial_ms: Option<u64>,
+    /// Override `[client].retry_max_ms` for this server.
+    #[serde(default)]
+    pub retry_max_ms: Option<u64>,
     /// Override `[client].retries` for this server.
     #[serde(default)]
     pub retries: Option<u32>,
@@ -409,6 +473,12 @@ fn default_interval() -> u64 {
 }
 fn default_challenge_timeout() -> u64 {
     5
+}
+fn default_retry_initial_ms() -> u64 {
+    500
+}
+fn default_retry_max_ms() -> u64 {
+    4_000
 }
 fn default_retries() -> u32 {
     3
@@ -449,10 +519,15 @@ impl ClientConfig {
                 ));
             }
         }
-        // 0-second timeouts would make the operation fail instantly.
-        if cfg.client.challenge_timeout_seconds == 0 {
+        // SIP retry backoff knobs must be positive and ordered.
+        if cfg.client.retry_initial_ms == 0 || cfg.client.retry_max_ms == 0 {
             return Err(ConfigError::Invalid(
-                "client.challenge_timeout_seconds must be >= 1".into(),
+                "client.retry_initial_ms and client.retry_max_ms must be >= 1".into(),
+            ));
+        }
+        if cfg.client.retry_initial_ms > cfg.client.retry_max_ms {
+            return Err(ConfigError::Invalid(
+                "client.retry_initial_ms must be <= client.retry_max_ms".into(),
             ));
         }
         if cfg.client.param_command.is_some() && cfg.client.param_command_timeout_seconds == 0 {
@@ -467,21 +542,25 @@ impl ClientConfig {
                 "client.param_max_len must be between 1 and 60000".into(),
             ));
         }
-        // Validate each additional server target. The map key is its server_id.
-        for (server_id, ov) in &cfg.client.servers {
-            if server_id.is_empty() {
+        // Validate each additional server target. The map key is a local LABEL
+        // (its wire server_id is `ServerOverride::server_id`, defaulting to it).
+        for (label, ov) in &cfg.client.servers {
+            if label.is_empty() {
                 return Err(ConfigError::Invalid(
-                    "client.servers entries must have a non-empty server_id (the table key)".into(),
+                    "client.servers entries must have a non-empty label (the table key)".into(),
                 ));
             }
-            if *server_id == cfg.client.server_id {
+            // The label keys the status map; keep it distinct from the primary's
+            // server_id so the two never collide there.
+            if *label == cfg.client.server_id {
                 return Err(ConfigError::Invalid(format!(
-                    "client.servers.{server_id} duplicates the primary [client] server_id"
+                    "client.servers.{label} label collides with the primary [client] server_id; \
+                     pick a different label"
                 )));
             }
             if ov.server_addr.is_empty() {
                 return Err(ConfigError::Invalid(format!(
-                    "client.servers.{server_id}.server_addr must not be empty"
+                    "client.servers.{label}.server_addr must not be empty"
                 )));
             }
             // Effective settings inherit from [client] when not overridden.
@@ -494,31 +573,42 @@ impl ClientConfig {
             // Each server has its own key; it is never inherited from [client].
             if (wire || has_param) && ov.server_encryption_key.is_none() {
                 return Err(ConfigError::Invalid(format!(
-                    "client.servers.{server_id}.server_encryption_key is required when its \
+                    "client.servers.{label}.server_encryption_key is required when its \
                      wire_encryption is true or a param_command applies"
                 )));
             }
             if let Some(argv) = &ov.param_command {
                 if argv.is_empty() {
                     return Err(ConfigError::Invalid(format!(
-                        "client.servers.{server_id}.param_command must not be an empty array"
+                        "client.servers.{label}.param_command must not be an empty array"
                     )));
                 }
             }
             if ov.interval_seconds == Some(0) {
                 return Err(ConfigError::Invalid(format!(
-                    "client.servers.{server_id}.interval_seconds must be >= 1"
+                    "client.servers.{label}.interval_seconds must be >= 1"
                 )));
             }
-            if ov.challenge_timeout_seconds == Some(0) {
+            // Effective retry backoff (inherits from [client]) must be positive
+            // and ordered.
+            let rt_init = ov.retry_initial_ms.unwrap_or(cfg.client.retry_initial_ms);
+            let rt_max = ov.retry_max_ms.unwrap_or(cfg.client.retry_max_ms);
+            if rt_init == 0 || rt_max == 0 || rt_init > rt_max {
                 return Err(ConfigError::Invalid(format!(
-                    "client.servers.{server_id}.challenge_timeout_seconds must be >= 1"
+                    "client.servers.{label} retry_initial_ms/retry_max_ms must be >= 1 with \
+                     retry_initial_ms <= retry_max_ms"
+                )));
+            }
+            // Mirrors the primary's check: a 0 timeout fails every param pulse.
+            if ov.param_command_timeout_seconds == Some(0) {
+                return Err(ConfigError::Invalid(format!(
+                    "client.servers.{label}.param_command_timeout_seconds must be >= 1"
                 )));
             }
             if let Some(n) = ov.param_max_len {
                 if n == 0 || n > 60_000 {
                     return Err(ConfigError::Invalid(format!(
-                        "client.servers.{server_id}.param_max_len must be between 1 and 60000"
+                        "client.servers.{label}.param_max_len must be between 1 and 60000"
                     )));
                 }
             }
@@ -620,6 +710,88 @@ mod tests {
         assert_eq!(cfg.command.max_concurrent, 4);
         assert!(!cfg.command.allow_shell);
         assert_eq!(cfg.clients.len(), 1);
+        // Lease defaults: revoke off, tolerate-2-misses multiplier, day cap.
+        assert!(cfg.command.revoke_argv.is_none());
+        assert_eq!(cfg.server.lease_grace_multiplier, 3);
+        assert_eq!(cfg.server.lease_max_seconds, 86_400);
+    }
+
+    fn server_toml_with(extra_server: &str, extra_command: &str) -> String {
+        format!(
+            r#"
+            [server]
+            bind = "0.0.0.0:7370"
+            server_id = "signedpulse-main"
+            wire_encryption = "off"
+            {extra_server}
+            [command]
+            argv = ["/bin/echo", "{{ip}}"]
+            {extra_command}
+            [[clients]]
+            client_id = "{HEX_ID}"
+            public_key = "AAAA"
+        "#
+        )
+    }
+
+    #[test]
+    fn server_config_accepts_revoke_argv() {
+        let t = write_temp(&server_toml_with(
+            "",
+            r#"revoke_argv = ["/usr/local/sbin/hook", "revoke", "{ip}"]"#,
+        ));
+        let cfg = ServerConfig::load(t.path()).unwrap();
+        assert_eq!(cfg.command.revoke_argv.as_ref().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn server_config_rejects_empty_revoke_argv() {
+        let t = write_temp(&server_toml_with("", "revoke_argv = []"));
+        assert!(matches!(
+            ServerConfig::load(t.path()),
+            Err(ConfigError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn server_config_rejects_out_of_range_lease_knobs() {
+        for line in [
+            "lease_grace_multiplier = 0",
+            "lease_max_seconds = 0",
+            "lease_max_seconds = 999999999999", // overflow guard: > 1 year
+        ] {
+            let t = write_temp(&server_toml_with(line, ""));
+            assert!(
+                matches!(ServerConfig::load(t.path()), Err(ConfigError::Invalid(_))),
+                "expected {line:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn client_config_rejects_bad_retry_knobs() {
+        for line in [
+            "retry_initial_ms = 0",
+            "retry_max_ms = 0",
+            "retry_initial_ms = 5000\nretry_max_ms = 1000", // initial > max
+        ] {
+            let toml = format!(
+                r#"
+                [client]
+                client_id = "{HEX_ID2}"
+                server_addr = "127.0.0.1:7370"
+                server_id = "sp-A"
+                private_key = "AAAA"
+                wire_encryption = false
+                {line}
+            "#
+            );
+            let t = write_temp(&toml);
+            assert!(
+                matches!(ClientConfig::load(t.path()), Err(ConfigError::Invalid(_))),
+                "expected {line:?} to be rejected"
+            );
+        }
     }
 
     #[test]
@@ -808,6 +980,32 @@ mod tests {
             cfg.client.servers["velizy1"].server_id.as_deref(),
             Some("sp-A")
         );
+    }
+
+    #[test]
+    fn client_config_rejects_secondary_zero_param_command_timeout() {
+        let toml = format!(
+            r#"
+            [client]
+            client_id = "{HEX_ID2}"
+            server_addr = "127.0.0.1:7370"
+            server_id = "sp-A"
+            private_key = "AAAA"
+            wire_encryption = false
+
+            [client.servers.sp-B]
+            server_addr = "10.0.0.2:7370"
+            wire_encryption = false
+            server_encryption_key = "AAAA"
+            param_command = ["/bin/echo", "x"]
+            param_command_timeout_seconds = 0
+        "#
+        );
+        let t = write_temp(&toml);
+        assert!(matches!(
+            ClientConfig::load(t.path()),
+            Err(ConfigError::Invalid(_))
+        ));
     }
 
     #[test]

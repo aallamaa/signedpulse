@@ -32,6 +32,7 @@ fn now_unix() -> i64 {
 struct Fixture {
     addr: SocketAddr,
     mock: MockCommandExecutor,
+    revoke: MockCommandExecutor,
     server: Arc<Server>,
     client_id: ClientId,
     signing_key: ed25519_dalek::SigningKey,
@@ -39,6 +40,9 @@ struct Fixture {
     encrypt: bool,
     _shutdown: tokio::sync::oneshot::Sender<()>,
 }
+
+/// The pulse interval the test client advertises in its RESPONSE.
+const TEST_INTERVAL_SECS: u32 = 1;
 
 /// Build a server with one authorized client and spawn it on an ephemeral port.
 async fn fixture(encrypt: bool, max_param_len: usize, state_file: Option<&str>) -> Fixture {
@@ -61,9 +65,10 @@ async fn fixture(encrypt: bool, max_param_len: usize, state_file: Option<&str>) 
         max_param_len = {max_param_len}
         wire_encryption = "{wire}"
         encryption_private_key = "{enc_secret}"
+        lease_max_seconds = 1
         {state_line}
         [command]
-        argv = ["/bin/true", "{{ip}}", "{{client_id}}", "{{param}}"]
+        argv = ["/bin/true", "{{ip}}", "{{client_id}}", "{{param}}", "{{new}}"]
         max_concurrent = 4
 
         [[clients]]
@@ -77,7 +82,15 @@ async fn fixture(encrypt: bool, max_param_len: usize, state_file: Option<&str>) 
     let config: ServerConfig = toml::from_str(&toml).expect("config parses");
 
     let mock = MockCommandExecutor::new();
-    let server = Arc::new(Server::from_config(config, Arc::new(mock.clone())).unwrap());
+    let revoke = MockCommandExecutor::new();
+    let server = Arc::new(
+        Server::from_config(
+            config,
+            Arc::new(mock.clone()),
+            Some(Arc::new(revoke.clone())),
+        )
+        .unwrap(),
+    );
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = socket.local_addr().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -94,6 +107,7 @@ async fn fixture(encrypt: bool, max_param_len: usize, state_file: Option<&str>) 
     Fixture {
         addr,
         mock,
+        revoke,
         server,
         client_id,
         signing_key,
@@ -168,12 +182,14 @@ impl Fixture {
             SERVER_ID,
             &client_hex,
             &B64.encode(challenge.nonce),
+            TEST_INTERVAL_SECS,
             challenge.expires_at_unix,
             &param_b64,
         );
         let response = Packet::Response(Response {
             client_id: self.client_id,
             nonce: challenge.nonce,
+            interval_seconds: TEST_INTERVAL_SECS,
             param: param_blob,
             signature: crypto::sign_payload_raw(&self.signing_key, &rp),
         });
@@ -297,4 +313,30 @@ async fn status_snapshot_reflects_verified_pulse() {
     assert_eq!(hook.client_id, "tester");
 
     let _ = std::fs::remove_file(&state_path);
+}
+
+#[tokio::test]
+async fn lease_grants_marks_new_then_revokes_on_expiry() {
+    let fx = fixture(true, 256, None).await;
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let local = sock.local_addr().unwrap();
+
+    // First pulse: grant hook fires, flagged as a new session.
+    fx.handshake(&sock, None).await;
+    wait_for(|| fx.mock.count() >= 1).await;
+    let grant = fx.mock.executions();
+    assert_eq!(grant[0].source_ip, local.ip());
+    assert!(grant[0].is_new, "first pulse must be flagged new");
+    assert_eq!(fx.revoke.count(), 0, "no revoke before expiry");
+
+    // lease_max_seconds = 1, so the lease expires shortly; a forced scan then
+    // runs the revoke hook for that IP (hex client id, not the label).
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    fx.server.run_lease_scan();
+    wait_for(|| fx.revoke.count() >= 1).await;
+    let revoked = fx.revoke.executions();
+    assert_eq!(revoked.len(), 1);
+    assert_eq!(revoked[0].source_ip, local.ip());
+    assert_eq!(revoked[0].client_id, fx.client_id.to_hex());
+    assert!(!revoked[0].is_new, "revoke is not a new session");
 }

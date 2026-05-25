@@ -22,7 +22,7 @@ use signedpulse_common::protocol::{
 };
 use signedpulse_common::status::{self, ClientStatusSnapshot, ServerLegStatus};
 use tokio::net::UdpSocket;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use zeroize::Zeroizing;
 
 /// Listens for the on-demand status-dump request (SIGUSR1 on unix). On
@@ -72,7 +72,10 @@ struct ServerTarget {
     server_pub: Option<X25519Bytes>,
     wire_encryption: bool,
     interval: Duration,
-    challenge_timeout: Duration,
+    /// SIP-style retry backoff: per-attempt CHALLENGE wait =
+    /// min(retry_initial × 2^(k-1), retry_max).
+    retry_initial: Duration,
+    retry_max: Duration,
     retries: u32,
     param_command: Option<Vec<String>>,
     param_command_timeout: Duration,
@@ -105,7 +108,8 @@ impl Client {
             c.server_encryption_key.as_deref(),
             c.wire_encryption,
             c.interval_seconds,
-            c.challenge_timeout_seconds,
+            c.retry_initial_ms,
+            c.retry_max_ms,
             c.retries,
             c.param_command.clone(),
             c.param_command_timeout_seconds,
@@ -175,6 +179,12 @@ impl Client {
         }
         let mut dump = DumpListener::new()?;
 
+        // Spawn one supervised pulse loop per server target. `run_loop` never
+        // returns normally (it loops forever), so a leg finishing means it
+        // panicked. Rather than let it die silently behind a healthy-looking
+        // process, we surface it and exit non-zero so the service manager
+        // restarts all legs.
+        let mut legs = tokio::task::JoinSet::new();
         for target in &self.targets {
             let pulser = Pulser {
                 signing_key: self.signing_key.clone(),
@@ -182,14 +192,29 @@ impl Client {
                 target: target.clone(),
                 status: self.status.clone(),
             };
-            tokio::spawn(async move { pulser.run_loop().await });
+            let name = target.name.clone();
+            legs.spawn(async move {
+                pulser.run_loop().await;
+                name
+            });
         }
 
-        // The pulse loops run in the background; this task stays alive to answer
-        // status-dump requests promptly.
+        // Stay alive to answer status-dump requests; abort if any leg stops.
         loop {
-            dump.recv().await;
-            self.write_status();
+            tokio::select! {
+                _ = dump.recv() => self.write_status(),
+                joined = legs.join_next() => match joined {
+                    Some(Ok(name)) => {
+                        error!(server = %name, "pulse leg exited unexpectedly");
+                        anyhow::bail!("pulse leg {name:?} stopped");
+                    }
+                    Some(Err(e)) => {
+                        error!(error = %e, "a pulse leg panicked");
+                        anyhow::bail!("a pulse leg panicked: {e}");
+                    }
+                    None => anyhow::bail!("no pulse legs are running"),
+                },
+            }
         }
     }
 }
@@ -203,7 +228,8 @@ fn resolve_target(
     enc_key_b64: Option<&str>,
     wire_encryption: bool,
     interval_seconds: u64,
-    challenge_timeout_seconds: u64,
+    retry_initial_ms: u64,
+    retry_max_ms: u64,
     retries: u32,
     param_command: Option<Vec<String>>,
     param_command_timeout_seconds: u64,
@@ -229,7 +255,8 @@ fn resolve_target(
         server_pub,
         wire_encryption,
         interval: Duration::from_secs(interval_seconds),
-        challenge_timeout: Duration::from_secs(challenge_timeout_seconds),
+        retry_initial: Duration::from_millis(retry_initial_ms),
+        retry_max: Duration::from_millis(retry_max_ms),
         retries,
         param_command,
         param_command_timeout: Duration::from_secs(param_command_timeout_seconds),
@@ -252,8 +279,8 @@ fn resolve_override(
         ov.server_encryption_key.as_deref(),
         ov.wire_encryption.unwrap_or(base.wire_encryption),
         ov.interval_seconds.unwrap_or(base.interval_seconds),
-        ov.challenge_timeout_seconds
-            .unwrap_or(base.challenge_timeout_seconds),
+        ov.retry_initial_ms.unwrap_or(base.retry_initial_ms),
+        ov.retry_max_ms.unwrap_or(base.retry_max_ms),
         ov.retries.unwrap_or(base.retries),
         ov.param_command
             .clone()
@@ -327,17 +354,29 @@ impl Pulser {
 
         let retries = self.target.retries.max(1);
         for attempt in 1..=retries {
-            match self.attempt_once(&socket, param.as_deref()).await {
+            // SIP-style backoff: attempt k waits T1·2^(k-1) for the CHALLENGE,
+            // capped at T2, before retransmitting.
+            let backoff = self
+                .target
+                .retry_initial
+                .saturating_mul(1u32 << (attempt - 1).min(31))
+                .min(self.target.retry_max);
+            match self.attempt_once(&socket, param.as_deref(), backoff).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    warn!(server = %self.target.name, attempt, max = retries, error = %e, "handshake attempt failed")
+                    warn!(server = %self.target.name, attempt, max = retries, timeout_ms = backoff.as_millis() as u64, error = %e, "handshake attempt failed")
                 }
             }
         }
         anyhow::bail!("all {retries} handshake attempts failed");
     }
 
-    async fn attempt_once(&self, socket: &UdpSocket, param: Option<&str>) -> anyhow::Result<()> {
+    async fn attempt_once(
+        &self,
+        socket: &UdpSocket,
+        param: Option<&str>,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
         let encrypt = self.target.wire_encryption;
         let client_hex = self.client_id.to_hex();
 
@@ -363,11 +402,9 @@ impl Pulser {
         socket.send(&datagram).await?;
         info!(server = %self.target.name, "sent HELLO");
 
-        // 3. Await CHALLENGE.
+        // 3. Await CHALLENGE (per-attempt SIP backoff timeout).
         let mut buf = vec![0u8; 2048];
-        let len = match tokio::time::timeout(self.target.challenge_timeout, socket.recv(&mut buf))
-            .await
-        {
+        let len = match tokio::time::timeout(timeout, socket.recv(&mut buf)).await {
             Ok(r) => r?,
             Err(_) => anyhow::bail!("timed out waiting for CHALLENGE"),
         };
@@ -395,16 +432,21 @@ impl Pulser {
             .as_ref()
             .map(|b| B64.encode(b))
             .unwrap_or_default();
+        // Advertise our pulse interval so the server can size the access lease
+        // (when to expect our next pulse). Signed alongside the rest.
+        let interval_seconds = self.target.interval.as_secs().min(u32::MAX as u64) as u32;
         let payload = response_signing_payload(
             &self.target.server_id,
             &client_hex,
             &B64.encode(challenge.nonce),
+            interval_seconds,
             challenge.expires_at_unix,
             &param_b64,
         );
         let response = Packet::Response(Response {
             client_id: self.client_id,
             nonce: challenge.nonce,
+            interval_seconds,
             param: param_blob,
             signature: crypto::sign_payload_raw(&self.signing_key, &payload),
         });

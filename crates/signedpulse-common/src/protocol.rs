@@ -18,8 +18,9 @@ use thiserror::Error;
 /// Protocol identifier, used only as a label inside the signing payloads.
 pub const PROTOCOL_NAME: &str = "signedpulse";
 
-/// Protocol version (4-bit on the wire).
-pub const PROTOCOL_VERSION: u8 = 1;
+/// Protocol version (4-bit on the wire). v2 added the client-advertised
+/// `interval_seconds` to the RESPONSE; a v1 peer's packets decode-fail here.
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// First header byte: a fixed marker (cleartext mode only).
 const MAGIC: u8 = 0x5A;
@@ -118,6 +119,10 @@ pub struct Challenge {
 pub struct Response {
     pub client_id: ClientId,
     pub nonce: [u8; CHALLENGE_NONCE_LEN],
+    /// The client's pulse interval (seconds): how often it will re-pulse this
+    /// server. The server uses it to size the access lease (when to expect the
+    /// next pulse). Covered by the signature.
+    pub interval_seconds: u32,
     /// Raw X25519 sealed-box bytes (see `crypto::seal_param`); `None` if absent.
     pub param: Option<Vec<u8>>,
     pub signature: [u8; SIG_LEN],
@@ -157,6 +162,7 @@ impl Packet {
                 out.extend_from_slice(&header(TYPE_RESPONSE));
                 out.extend_from_slice(&r.client_id.0);
                 out.extend_from_slice(&r.nonce);
+                out.extend_from_slice(&r.interval_seconds.to_le_bytes());
                 let param = r.param.as_deref().unwrap_or(&[]);
                 out.extend_from_slice(&(param.len() as u16).to_le_bytes());
                 out.extend_from_slice(param);
@@ -194,12 +200,14 @@ impl Packet {
             TYPE_RESPONSE => {
                 let client_id = ClientId(r.array::<CLIENT_ID_LEN>()?);
                 let nonce = r.array::<CHALLENGE_NONCE_LEN>()?;
+                let interval_seconds = r.u32()?;
                 let param_len = r.u16()? as usize;
                 let param_bytes = r.take(param_len)?.to_vec();
                 let signature = r.array::<SIG_LEN>()?;
                 Packet::Response(Response {
                     client_id,
                     nonce,
+                    interval_seconds,
                     param: if param_len == 0 {
                         None
                     } else {
@@ -243,6 +251,10 @@ impl<'a> Reader<'a> {
         let b = self.take(2)?;
         Ok(u16::from_le_bytes([b[0], b[1]]))
     }
+    fn u32(&mut self) -> Result<u32, ProtocolError> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes(b.try_into().unwrap()))
+    }
     fn i64(&mut self) -> Result<i64, ProtocolError> {
         let b = self.take(8)?;
         Ok(i64::from_le_bytes(b.try_into().unwrap()))
@@ -261,10 +273,11 @@ impl<'a> Reader<'a> {
 /// `param` line is the base64 *ciphertext* (or empty) — encrypt-then-sign.
 ///
 /// ```text
-/// signedpulse:v1:response
+/// signedpulse:v2:response
 /// server_id=<server_id>
 /// client_id=<client_id_hex>
 /// nonce=<base64_nonce>
+/// interval=<interval_seconds>
 /// expires_at=<expires_at_unix>
 /// param=<base64_ciphertext_or_empty>
 /// ```
@@ -272,6 +285,7 @@ pub fn response_signing_payload(
     server_id: &str,
     client_id_hex: &str,
     nonce_b64: &str,
+    interval_seconds: u32,
     expires_at_unix: i64,
     param_ciphertext_b64: &str,
 ) -> Vec<u8> {
@@ -280,6 +294,7 @@ pub fn response_signing_payload(
          server_id={server_id}\n\
          client_id={client_id_hex}\n\
          nonce={nonce_b64}\n\
+         interval={interval_seconds}\n\
          expires_at={expires_at_unix}\n\
          param={param_ciphertext_b64}"
     )
@@ -346,12 +361,14 @@ mod tests {
             Packet::Response(Response {
                 client_id: cid(4),
                 nonce: [5; CHALLENGE_NONCE_LEN],
+                interval_seconds: 300,
                 param: Some(vec![1, 2, 3, 4]),
                 signature: [6; SIG_LEN],
             }),
             Packet::Response(Response {
                 client_id: cid(4),
                 nonce: [5; CHALLENGE_NONCE_LEN],
+                interval_seconds: 0,
                 param: None,
                 signature: [6; SIG_LEN],
             }),
@@ -411,6 +428,22 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_v1_packets() {
+        // A v1 peer's packet must be rejected by this v2 build (clean drop).
+        let mut bytes = Packet::Challenge(Challenge {
+            client_id: cid(2),
+            nonce: [0; CHALLENGE_NONCE_LEN],
+            expires_at_unix: 0,
+        })
+        .encode();
+        bytes[1] = (1 << 4) | TYPE_CHALLENGE; // force version nibble to 1
+        assert!(matches!(
+            Packet::decode(&bytes),
+            Err(ProtocolError::WrongVersion(1))
+        ));
+    }
+
+    #[test]
     fn decode_rejects_trailing_bytes() {
         let mut bytes = Packet::Challenge(Challenge {
             client_id: cid(2),
@@ -431,13 +464,15 @@ mod tests {
             "signedpulse-main",
             "ab",
             "QUJDREVG",
+            300,
             1_700_000_030,
             "Q0lQSEVS",
         );
-        let expected = "signedpulse:v1:response\n\
+        let expected = "signedpulse:v2:response\n\
              server_id=signedpulse-main\n\
              client_id=ab\n\
              nonce=QUJDREVG\n\
+             interval=300\n\
              expires_at=1700000030\n\
              param=Q0lQSEVS";
         assert_eq!(payload, expected.as_bytes());
@@ -445,12 +480,13 @@ mod tests {
 
     #[test]
     fn canonical_payloads_change_with_each_field() {
-        let base = response_signing_payload("s", "c", "n", 1, "p");
-        assert_ne!(base, response_signing_payload("S", "c", "n", 1, "p"));
-        assert_ne!(base, response_signing_payload("s", "C", "n", 1, "p"));
-        assert_ne!(base, response_signing_payload("s", "c", "N", 1, "p"));
-        assert_ne!(base, response_signing_payload("s", "c", "n", 2, "p"));
-        assert_ne!(base, response_signing_payload("s", "c", "n", 1, "P"));
+        let base = response_signing_payload("s", "c", "n", 1, 1, "p");
+        assert_ne!(base, response_signing_payload("S", "c", "n", 1, 1, "p"));
+        assert_ne!(base, response_signing_payload("s", "C", "n", 1, 1, "p"));
+        assert_ne!(base, response_signing_payload("s", "c", "N", 1, 1, "p"));
+        assert_ne!(base, response_signing_payload("s", "c", "n", 9, 1, "p"));
+        assert_ne!(base, response_signing_payload("s", "c", "n", 1, 2, "p"));
+        assert_ne!(base, response_signing_payload("s", "c", "n", 1, 1, "P"));
 
         let hbase = hello_signing_payload("s", "c", 1, "n");
         assert_ne!(hbase, hello_signing_payload("S", "c", 1, "n"));
