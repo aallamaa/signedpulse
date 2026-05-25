@@ -493,6 +493,24 @@ signedpulse-client --config /etc/signedpulse/client.toml
 
 Logging verbosity is controlled with `RUST_LOG`, e.g. `RUST_LOG=debug`.
 
+### One-shot pulse / ping (no daemon)
+
+Instead of running the client as a service you can fire a single handshake and
+exit — handy for cron, scripts, or testing connectivity:
+
+```sh
+signedpulse-client pulse    # one HELLO→CHALLENGE→RESPONSE per server, NO retry
+signedpulse-client ping     # same, but retries (SIP backoff) if no reply
+```
+
+Both run one cycle against every configured server (the `[client]` primary and
+each `[client.servers.*]`), print a per-server `ok` / `FAILED` line, and exit
+non-zero if any server did not respond — so they compose with shell `&&` and
+cron alerting. `pulse` makes exactly one attempt (waiting up to `retry_max_ms`
+for the reply); `ping` makes up to `retries` attempts with the configured
+backoff. (A daemonized client keeps the access lease alive; a periodic `pulse`
+from cron does too, as long as it runs more often than the lease TTL.)
+
 ### Generating a keypair by hand
 
 `signedpulse-client init` generates keys for you. If you want a bare keypair

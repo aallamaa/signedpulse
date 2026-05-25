@@ -217,6 +217,38 @@ impl Client {
             }
         }
     }
+
+    /// One-shot: run a single handshake against every configured server and
+    /// exit. With `retry` false (`pulse`) each server gets exactly one attempt;
+    /// with `retry` true (`ping`) the configured SIP retry/backoff is used.
+    /// Prints a per-server result line and returns `Err` if any server failed,
+    /// so the process exit code reflects success (useful in scripts/cron).
+    pub async fn run_once(&self, retry: bool) -> anyhow::Result<()> {
+        let mut failures = 0usize;
+        for target in &self.targets {
+            let pulser = Pulser {
+                signing_key: self.signing_key.clone(),
+                client_id: self.client_id,
+                target: target.clone(),
+                status: self.status.clone(),
+            };
+            let attempts = if retry { target.retries.max(1) } else { 1 };
+            match pulser.run_cycle(attempts).await {
+                Ok(()) => println!("{} ({}): ok", target.name, target.server_addr),
+                Err(e) => {
+                    println!("{} ({}): FAILED — {e}", target.name, target.server_addr);
+                    failures += 1;
+                }
+            }
+        }
+        if failures > 0 {
+            anyhow::bail!(
+                "{failures}/{} server(s) did not respond",
+                self.targets.len()
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Build a target from explicit values (used for the primary [client] server).
@@ -324,7 +356,7 @@ impl Pulser {
             {
                 leg.last_attempt_at_unix = Some(now);
             }
-            let result = self.run_cycle().await;
+            let result = self.run_cycle(self.target.retries).await;
             {
                 let mut s = self.status.lock().unwrap();
                 if let Some(leg) = s.servers.get_mut(&self.target.name) {
@@ -344,31 +376,37 @@ impl Pulser {
         }
     }
 
-    /// One full HELLO → CHALLENGE → RESPONSE exchange, with retries on packet
-    /// loss. The parameter is generated once per cycle and reused across retries.
-    async fn run_cycle(&self) -> anyhow::Result<()> {
+    /// One full HELLO → CHALLENGE → RESPONSE exchange. `max_attempts` bounds the
+    /// retransmits: the daemon and `ping` pass the configured `retries` (SIP
+    /// backoff between attempts); a single-shot `pulse` passes 1. The parameter
+    /// is generated once and reused across retries.
+    async fn run_cycle(&self, max_attempts: u32) -> anyhow::Result<()> {
         let param = self.generate_param().await?;
 
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
         socket.connect(&self.target.server_addr).await?;
 
-        let retries = self.target.retries.max(1);
-        for attempt in 1..=retries {
+        let attempts = max_attempts.max(1);
+        for attempt in 1..=attempts {
             // SIP-style backoff: attempt k waits T1·2^(k-1) for the CHALLENGE,
-            // capped at T2, before retransmitting.
-            let backoff = self
-                .target
-                .retry_initial
-                .saturating_mul(1u32 << (attempt - 1).min(31))
-                .min(self.target.retry_max);
-            match self.attempt_once(&socket, param.as_deref(), backoff).await {
+            // capped at T2, before retransmitting. A single-shot run (attempts
+            // == 1) waits the full T2 window once rather than only T1.
+            let timeout = if attempts == 1 {
+                self.target.retry_max
+            } else {
+                self.target
+                    .retry_initial
+                    .saturating_mul(1u32 << (attempt - 1).min(31))
+                    .min(self.target.retry_max)
+            };
+            match self.attempt_once(&socket, param.as_deref(), timeout).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    warn!(server = %self.target.name, attempt, max = retries, timeout_ms = backoff.as_millis() as u64, error = %e, "handshake attempt failed")
+                    warn!(server = %self.target.name, attempt, max = attempts, timeout_ms = timeout.as_millis() as u64, error = %e, "handshake attempt failed")
                 }
             }
         }
-        anyhow::bail!("all {retries} handshake attempts failed");
+        anyhow::bail!("all {attempts} handshake attempt(s) failed");
     }
 
     async fn attempt_once(
