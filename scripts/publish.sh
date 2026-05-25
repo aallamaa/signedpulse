@@ -34,6 +34,10 @@ echo "crates (in order): ${CRATES[*]}"
 echo
 
 # --- Pre-flight: clean tree + the full quality gate -------------------------
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "ERROR: not inside a git repository — refusing to publish from an unversioned tree." >&2
+  exit 1
+fi
 if [ -n "$(git status --porcelain)" ]; then
   echo "ERROR: working tree has uncommitted changes — commit (and tag v${VERSION}) first." >&2
   exit 1
@@ -49,10 +53,10 @@ cargo test --workspace --locked
 echo "    gate passed."
 echo
 
-# --- Dry run: only the leaf crate can verify before its deps are live -------
+# --- Dry run: only the dependency root can verify before its deps are live --
 if [ "$DRY_RUN" = 1 ]; then
-  echo "==> dry-run: packaging ${CRATES[0]} (dependent crates can't be verified"
-  echo "    until ${CRATES[0]} is actually on crates.io)"
+  echo "==> dry-run: packaging ${CRATES[0]} (the dependency root; the dependent"
+  echo "    crates can't be verified until ${CRATES[0]} is actually on crates.io)"
   cargo publish -p "${CRATES[0]}" --dry-run
   echo "    dry-run OK."
   exit 0
