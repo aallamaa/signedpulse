@@ -250,10 +250,25 @@ impl Server {
         if expired.is_empty() {
             return;
         }
+        // Resolve each lease's hex client_id to its display name now, while we
+        // still have `self.clients` (the spawned task doesn't); falls back to the
+        // hex when the client is no longer configured. This makes `last_revoke`
+        // read like `last_hook` (label / short hex) instead of raw hex.
+        let items: Vec<(crate::rate_limit::ExpiredLease, String)> = expired
+            .into_iter()
+            .map(|e| {
+                let name = ClientId::from_hex(&e.client_id)
+                    .ok()
+                    .and_then(|id| self.clients.get(&id))
+                    .map(|info| info.name.clone())
+                    .unwrap_or_else(|| e.client_id.clone());
+                (e, name)
+            })
+            .collect();
         let leases = self.leases.clone();
         let status = self.status.clone();
         tokio::spawn(async move {
-            for e in expired {
+            for (e, name) in items {
                 // The IP re-pulsed and holds a fresh lease again — skip the stale
                 // revoke so we don't tear down access a new grant just re-opened.
                 if leases.is_live(e.ip) {
@@ -267,11 +282,11 @@ impl Server {
                         if result.timed_out {
                             warn!(ip = %e.ip, "revoke hook timed out");
                         } else {
-                            info!(ip = %e.ip, client_id = %e.client_id, exit_code = ?result.exit_code, "lease expired; access revoked");
+                            info!(ip = %e.ip, client = %name, exit_code = ?result.exit_code, "lease expired; access revoked");
                         }
                         let mut s = status.lock().unwrap();
                         s.last_revoke = Some(HookInfo {
-                            client_id: e.client_id,
+                            client_id: name,
                             source_ip: e.ip,
                             at_unix: now_unix(),
                             exit_code: result.exit_code,

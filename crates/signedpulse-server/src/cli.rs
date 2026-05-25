@@ -154,7 +154,7 @@ fn status(config_path: &Path) -> anyhow::Result<()> {
             }
             if let Some(h) = &s.last_revoke {
                 println!(
-                    "last revoke: {} -> {}  {}  {}",
+                    "last revoke: \"{}\" -> {}  {}  {}",
                     h.client_id,
                     h.source_ip,
                     if h.timed_out {
