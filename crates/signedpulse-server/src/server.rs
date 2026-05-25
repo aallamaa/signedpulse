@@ -17,7 +17,7 @@ use signedpulse_common::crypto::{self, Nonce, X25519Bytes};
 use signedpulse_common::protocol::{
     hello_signing_payload, response_signing_payload, Challenge, ClientId, Hello, Packet, Response,
 };
-use signedpulse_common::status::{self, HookInfo, PulseInfo, ServerStatusSnapshot};
+use signedpulse_common::status::{self, HookInfo, LeaseInfo, PulseInfo, ServerStatusSnapshot};
 use tokio::net::UdpSocket;
 use tracing::{debug, error, info, warn};
 
@@ -208,7 +208,19 @@ impl Server {
     /// and directly from tests. Errors are logged, not fatal.
     pub fn write_status(&self) {
         let mut snapshot = self.status.lock().unwrap().clone();
-        snapshot.active_leases = self.leases.active_count();
+        let mut leases: Vec<LeaseInfo> = self
+            .leases
+            .live_snapshot()
+            .into_iter()
+            .map(|(ip, client_id, revoke_in_seconds)| LeaseInfo {
+                source_ip: ip,
+                client_id,
+                revoke_in_seconds,
+            })
+            .collect();
+        leases.sort_by_key(|l| l.revoke_in_seconds);
+        snapshot.active_leases = leases.len();
+        snapshot.leases = leases;
         if let Err(e) = status::write_snapshot(&self.state_path, &snapshot) {
             warn!(path = %self.state_path.display(), error = %e, "failed to write status file");
         }

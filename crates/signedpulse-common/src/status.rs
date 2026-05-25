@@ -21,6 +21,17 @@ pub struct PulseInfo {
     pub at_unix: i64,
 }
 
+/// A live access lease: a source IP allowed while it keeps pulsing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LeaseInfo {
+    pub source_ip: IpAddr,
+    /// The client_id (canonical hex) that last renewed this lease.
+    pub client_id: String,
+    /// Seconds until the lease expires (and the revoke hook runs) if no further
+    /// pulse arrives.
+    pub revoke_in_seconds: u64,
+}
+
 /// The result of running the hook command.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HookInfo {
@@ -52,6 +63,9 @@ pub struct ServerStatusSnapshot {
     /// Live access leases currently held (source IPs allowed while pulsing).
     #[serde(default)]
     pub active_leases: usize,
+    /// Detail of each live lease, including how long until it would be revoked.
+    #[serde(default)]
+    pub leases: Vec<LeaseInfo>,
     /// Last REVOKE hook run when an access lease expired.
     #[serde(default)]
     pub last_revoke: Option<HookInfo>,

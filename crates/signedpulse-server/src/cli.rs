@@ -186,6 +186,29 @@ fn status(config_path: &Path) -> anyhow::Result<()> {
                     );
                 }
             }
+            if !s.leases.is_empty() {
+                // Map the lease's canonical hex client_id back to its label.
+                let labels: std::collections::HashMap<&str, &str> = config
+                    .clients
+                    .iter()
+                    .filter_map(|c| c.label.as_deref().map(|l| (c.client_id.as_str(), l)))
+                    .collect();
+                println!("leases (revoked when the countdown elapses with no new pulse):");
+                for l in &s.leases {
+                    let who = labels
+                        .get(l.client_id.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| {
+                            format!("{}…", &l.client_id[..12.min(l.client_id.len())])
+                        });
+                    println!(
+                        "  {:<20} {}  revoke in {}",
+                        l.source_ip.to_string(),
+                        who,
+                        status::duration_words(l.revoke_in_seconds as i64)
+                    );
+                }
+            }
         }
     }
     Ok(())

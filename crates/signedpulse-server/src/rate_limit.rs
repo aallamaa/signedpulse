@@ -570,6 +570,19 @@ impl LeaseTracker {
             .filter(|l| now < l.expires_at)
             .count()
     }
+
+    /// Snapshot of each live lease for status: (source IP, client_id, seconds
+    /// until it expires/revokes if no further pulse arrives).
+    pub fn live_snapshot(&self) -> Vec<(IpAddr, String, u64)> {
+        let now = Instant::now();
+        self.leases
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, l)| now < l.expires_at)
+            .map(|(ip, l)| (*ip, l.client_id.clone(), (l.expires_at - now).as_secs()))
+            .collect()
+    }
 }
 
 #[cfg(test)]

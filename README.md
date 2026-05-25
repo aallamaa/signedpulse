@@ -458,6 +458,8 @@ last hook:  "laptop-1" -> 203.0.113.7  exit 0  2m ago
 counters:  hello=144 verified=140 rejected=4 replays=0 leases=3
 clients:
   laptop-1             203.0.113.7:51456  2m ago
+leases (revoked when the countdown elapses with no new pulse):
+  203.0.113.7          laptop-1  revoke in 12m43s
 
 $ signedpulse-client status
 service:    active (running) [systemctl]
