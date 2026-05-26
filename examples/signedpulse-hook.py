@@ -8,18 +8,20 @@ when a source IP stops pulsing:
 
     [command]
     argv        = ["/usr/local/sbin/signedpulse-hook", "grant",  "{ip}", "{client_id}", "{new}"]
-    revoke_argv = ["/usr/local/sbin/signedpulse-hook", "revoke", "{ip}", "{client_id}", "{reason}"]
+    revoke_argv = ["/usr/local/sbin/signedpulse-hook", "revoke", "{ip}", "{client_id}", "{reason}", "{ip_clients}"]
 
 so this script receives, positionally:
 
-    argv[1] action       "grant" (each verified pulse) or "revoke" (access dropped)
+    argv[1] action       "grant" (each verified pulse) or "revoke" (a client's lease ended)
     argv[2] ip           the client's REAL source IP, from UDP packet metadata
     argv[3] client_id    the verified 64-hex client id
     argv[4] new/reason   grant: "1" on a new/reactivated session, "0" on a renewal;
                          revoke: why it fired — "expired" (lease timed out) or
                          "bye" (client released it on shutdown)
+    argv[5] ip_clients   revoke only: count of OTHER clients still on this source
+                         IP. Only close the IP-keyed firewall set when this is 0.
 
-The placeholders ({ip} {client_id} {source_port} {param} {new}) are passed as
+The placeholders ({ip} {client_id} {source_port} {param} {new} {reason} {ip_clients}) are passed as
 LITERAL argv elements — never through a shell — so they are safe to use directly.
 If you shell out, keep using subprocess with an argument LIST (never shell=True).
 
@@ -75,9 +77,11 @@ def main() -> int:
         return 2
 
     action, ip_str, client_id = args[0], args[1], args[2]
-    # 4th arg is {new} for grant, {reason} for revoke (the action selects meaning).
+    # 4th arg is {new} for grant, {reason} for revoke (the action selects meaning);
+    # 5th ({ip_clients}) is the count of OTHER clients still on this IP (revoke).
     is_new = len(args) > 3 and args[3] == "1"
     reason = args[3] if len(args) > 3 else "expired"
+    ip_clients = int(args[4]) if len(args) > 4 and args[4].isdigit() else 0
     who = client_id[:12]  # the server already validated this is canonical hex
 
     # The server passes the kernel-observed source IP, but validate defensively
@@ -103,6 +107,15 @@ def main() -> int:
         return 0
 
     if action == "revoke":
+        # A client's lease ended. The firewall set is keyed by IP, so only delete
+        # the IP when no OTHER client is still behind it (shared NAT).
+        if ip_clients > 0:
+            syslog.syslog(
+                syslog.LOG_INFO,
+                "client=%s… left %s (reason=%s); %d still active, keeping open"
+                % (who, ip, reason, ip_clients),
+            )
+            return 0
         # `delete element` errors if it's already gone — treat that as success.
         r = run_nft("delete", ip)
         ok = r.returncode == 0 or benign(r.stderr, "does not exist", "no such")

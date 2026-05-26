@@ -253,36 +253,25 @@ impl Server {
         }
         // Resolve each lease's hex client_id to its display name now, while we
         // still have `self.clients` (the spawned task doesn't); falls back to the
-        // hex when the client is no longer configured. `ip_freed` is whether this
-        // expiry was the last lease on its source IP (so the firewall pinhole
-        // should now close — the only case we run the revoke hook).
-        let items: Vec<(crate::rate_limit::ExpiredLease, String, bool)> = expired
+        // hex when the client is no longer configured. `remaining` is how many
+        // OTHER clients still hold a live lease on the same source IP (passed to
+        // the hook as {ip_clients}; 0 ⇒ the hook may close the firewall pinhole).
+        let items: Vec<(crate::rate_limit::ExpiredLease, String, usize)> = expired
             .into_iter()
-            .map(|(e, ip_freed)| {
+            .map(|(e, remaining)| {
                 let name = ClientId::from_hex(&e.client_id)
                     .ok()
                     .and_then(|id| self.clients.get(&id))
                     .map(|info| info.name.clone())
                     .unwrap_or_else(|| e.client_id.clone());
-                (e, name, ip_freed)
+                (e, name, remaining)
             })
             .collect();
-        let leases = self.leases.clone();
         let status = self.status.clone();
         tokio::spawn(async move {
-            for (e, name, ip_freed) in items {
-                // The client's lease ended, but a sibling client behind the same
-                // NAT IP still holds access — the pinhole stays open, so there is
-                // nothing to revoke for this client.
-                if !ip_freed {
-                    debug!(ip = %e.ip, client = %name, "lease ended; IP still in use by another client, not closing");
-                    continue;
-                }
-                // A client (any client) re-pulsed this IP between the sweep and
-                // now and re-established a lease — skip the stale close.
-                if leases.is_ip_live(e.ip) {
-                    continue;
-                }
+            for (e, name, remaining) in items {
+                // The revoke hook always runs (the firewall is just one consumer);
+                // {ip_clients}=remaining lets it decide whether to close the IP.
                 match revoke
                     .execute(
                         &e.client_id,
@@ -291,6 +280,7 @@ impl Server {
                         e.param.as_deref(),
                         false,
                         "expired",
+                        remaining,
                     )
                     .await
                 {
@@ -813,6 +803,8 @@ impl Server {
         //    so {client_id} is the verified identity an attacker cannot shape.
         let source_ip = peer.ip();
         let source_port = peer.port();
+        // Other clients sharing this source IP (for the hook's {ip_clients}).
+        let ip_clients = self.leases.others_on_ip(source_ip, &client_hex);
         match self
             .executor
             .execute(
@@ -822,6 +814,7 @@ impl Server {
                 param.as_deref(),
                 is_new,
                 "grant",
+                ip_clients,
             )
             .await
         {
@@ -938,24 +931,16 @@ impl Server {
 
         info!(%peer, client = %name, "BYE received; releasing access lease");
 
-        // 6. Release this client's own lease. `ip_freed` is true only when no
-        //    other client behind the same IP still holds a lease — the firewall
-        //    pinhole closes (revoke hook) only then; otherwise a sibling co-NAT
-        //    client keeps the IP open and there is nothing to revoke.
-        let Some((e, ip_freed)) = self.leases.release(&client_hex) else {
+        // 6. Release this client's own lease. `remaining` is how many OTHER
+        //    clients still hold a live lease on the same source IP — passed to
+        //    the revoke hook as {ip_clients} so it can decide whether to close
+        //    the firewall pinhole (0 ⇒ this was the last). The hook always runs.
+        let Some((e, remaining)) = self.leases.release(&client_hex) else {
             return; // this client held no lease (already expired/released)
         };
-        if !ip_freed {
-            info!(%peer, client = %name, "BYE: lease released; IP still in use by another client, not closing");
-            return;
-        }
         let Some(revoke) = &self.revoke_executor else {
             return; // no revoke hook configured; the lease is dropped regardless
         };
-        // A client re-pulsed this IP between release and now — keep it open.
-        if self.leases.is_ip_live(e.ip) {
-            return;
-        }
         let client_name = ClientId::from_hex(&e.client_id)
             .ok()
             .and_then(|id| self.clients.get(&id))
@@ -972,6 +957,7 @@ impl Server {
                 revoke_param.as_deref(),
                 false,
                 "bye",
+                remaining,
             )
             .await
         {

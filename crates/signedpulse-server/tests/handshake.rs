@@ -421,6 +421,7 @@ async fn lease_grants_marks_new_then_revokes_on_expiry() {
     assert_eq!(revoked[0].client_id, fx.client_id.to_hex());
     assert!(!revoked[0].is_new, "revoke is not a new session");
     assert_eq!(revoked[0].reason, "expired", "lease-timeout revoke");
+    assert_eq!(revoked[0].ip_clients, 0, "no other client on this IP");
 }
 
 #[tokio::test]
@@ -445,6 +446,7 @@ async fn bye_releases_lease_and_runs_revoke_with_param() {
     assert_eq!(revoked[0].param.as_deref(), Some("bye-param"));
     assert!(!revoked[0].is_new);
     assert_eq!(revoked[0].reason, "bye", "client-initiated release");
+    assert_eq!(revoked[0].ip_clients, 0, "sole client on this IP");
 
     // The lease is gone: re-pulsing is flagged as a brand-new session.
     let sock2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();

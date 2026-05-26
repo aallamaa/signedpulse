@@ -56,13 +56,17 @@ max_param_len = 256
 #                    after the access lease expired), "0" on a keep-alive renewal
 #   {reason}      -> why the hook ran: "grant" (verified pulse), "expired"
 #                    (lease timed out), or "bye" (client released it on shutdown)
+#   {ip_clients}  -> count of OTHER clients still holding a live lease on this
+#                    source IP. On a revoke, "0" means this was the last client
+#                    behind that (NAT) IP — only then close an IP-based firewall
+#                    rule; a non-zero count means a sibling still needs it open.
 argv = ["/usr/local/sbin/signedpulse-hook", "grant", "{ip}", "{client_id}", "{new}"]
-# Optional REVOKE hook: runs when a source IP stops pulsing for the lease TTL, or
-# immediately when the client sends a BYE on shutdown — closing what `argv`
-# opened. Same placeholders ({new} is always "0" here; use {reason} to tell a
-# "bye" from an "expired" timeout). Reuses working_dir/max_concurrent/allow_shell/
-# command_timeout. Make it IDEMPOTENT. Omit to leave access open once granted.
-# revoke_argv = ["/usr/local/sbin/signedpulse-hook", "revoke", "{ip}", "{client_id}", "{reason}"]
+# Optional REVOKE hook: runs PER CLIENT whenever a client's lease ends — it stops
+# pulsing for the lease TTL ("expired") or sends a BYE ("bye"). It always runs;
+# use {ip_clients} to decide whether to actually close a shared (NAT) pinhole.
+# Reuses working_dir/max_concurrent/allow_shell/command_timeout. Make it
+# IDEMPOTENT. Omit to leave access open once granted.
+# revoke_argv = ["/usr/local/sbin/signedpulse-hook", "revoke", "{ip}", "{client_id}", "{reason}", "{ip_clients}"]
 working_dir = "/"
 max_concurrent = 4
 allow_shell = false                # DANGEROUS if true; keep false

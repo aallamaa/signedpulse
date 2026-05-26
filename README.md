@@ -61,7 +61,7 @@ close it.
 # server.toml
 [command]
 argv        = ["/usr/local/sbin/signedpulse-hook", "grant",  "{ip}", "{client_id}", "{new}"]
-revoke_argv = ["/usr/local/sbin/signedpulse-hook", "revoke", "{ip}", "{client_id}", "{reason}"]
+revoke_argv = ["/usr/local/sbin/signedpulse-hook", "revoke", "{ip}", "{client_id}", "{reason}", "{ip_clients}"]
 ```
 
 The lease TTL is **derived from the client's own pulse interval**, which it
@@ -80,14 +80,19 @@ released it explicitly on shutdown — see below). The grant hook receives
 `reason=grant`. Use it to branch, e.g. `revoke … "{reason}"` then in the hook
 `case "$reason" in bye) … ;; expired) … ;; esac`.
 
-**Shared NAT.** Leases, cooldown, `{new}`, and per-client status all key on the
-authenticated **`client_id`**, so two clients behind one public IP are tracked
-independently — each gets its own grant and its own throttling. But the firewall
-filters on **source IP**, so the *revoke* (the pinhole close) is
-**reference-counted by IP**: when a client's lease ends, the revoke hook runs
-only if no other client behind that IP still holds a live lease. A co-NAT
-sibling that's still pulsing keeps the pinhole open — one client going silent
-never tears down another's access.
+**Shared NAT.** Everything keys on the authenticated **`client_id`** — leases,
+cooldown, `{new}`, per-client status, and the hooks all fire **per client**,
+independently. The revoke hook **always runs** when a client's lease ends; the
+server hands it `{ip_clients}` — the number of *other* clients still holding a
+live lease on the **same source IP**. The hook decides what that means: for a
+firewall that filters by IP, close the pinhole **only when `{ip_clients}` is 0**
+(you were the last client behind that NAT) — a still-pulsing sibling keeps it
+open. The firewall is just one consumer; another hook might log, page, or update
+a per-client record regardless of the count.
+
+```toml
+revoke_argv = ["/usr/local/sbin/signedpulse-hook", "revoke", "{ip}", "{client_id}", "{reason}", "{ip_clients}"]
+```
 
 Make both hooks **idempotent**: the grant runs on every pulse (and, behind a
 shared NAT, once per client → repeated `nft add` of the same IP), and because
@@ -653,12 +658,14 @@ lease_grace_multiplier = 3       # lease TTL = client interval × this (revoke a
 lease_max_seconds = 86400        # cap on a derived lease TTL
 
 [command]
-# Placeholders (literal args, no shell): {ip} {client_id} {source_port} {param} {new} {reason}
-#   {new}    = "1" on a new/reactivated session, "0" on a keep-alive renewal
-#   {reason} = "grant" | "expired" (lease timed out) | "bye" (client released it)
+# Placeholders (literal args, no shell): {ip} {client_id} {source_port} {param} {new} {reason} {ip_clients}
+#   {new}        = "1" on a new/reactivated session, "0" on a keep-alive renewal
+#   {reason}     = "grant" | "expired" (lease timed out) | "bye" (client released it)
+#   {ip_clients} = count of OTHER clients still on this source IP (0 = last one;
+#                  on a revoke, only close an IP-based firewall rule when it's 0)
 argv = ["/usr/local/sbin/signedpulse-hook", "grant", "{ip}", "{client_id}", "{new}"]
-# Optional auto-revoke when an IP stops pulsing or sends a BYE (omit to leave open):
-revoke_argv = ["/usr/local/sbin/signedpulse-hook", "revoke", "{ip}", "{client_id}", "{reason}"]
+# Optional per-client revoke (runs on every lease end / BYE; omit to leave open):
+revoke_argv = ["/usr/local/sbin/signedpulse-hook", "revoke", "{ip}", "{client_id}", "{reason}", "{ip_clients}"]
 working_dir = "/"
 max_concurrent = 4
 allow_shell = false              # DANGEROUS if true; keep false
