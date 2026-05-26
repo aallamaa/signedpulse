@@ -161,9 +161,26 @@ fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
     );
 
     // ── Activity ──────────────────────────────────────────────
+    // Most-recent across all clients, derived from the per-client map (not
+    // stored separately) — a quick "what did the server last do?" summary.
     println!("\n{}", st.bold("Activity"));
     let act = |k: &str, v: String| println!("  {}  {}", st.dim(&format!("{k:<12}")), v);
-    match &s.last_pulse {
+    let latest_pulse = s
+        .clients
+        .values()
+        .filter_map(|c| c.last_pulse.as_ref())
+        .max_by_key(|p| p.at_unix);
+    let latest_hook = s
+        .clients
+        .values()
+        .filter_map(|c| c.last_hook.as_ref())
+        .max_by_key(|h| h.at_unix);
+    let latest_revoke = s
+        .clients
+        .values()
+        .filter_map(|c| c.last_revoke.as_ref())
+        .max_by_key(|h| h.at_unix);
+    match latest_pulse {
         Some(p) => act(
             "last pulse",
             format!(
@@ -175,7 +192,7 @@ fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
         ),
         None => act("last pulse", st.dim("none yet")),
     }
-    match &s.last_hook {
+    match latest_hook {
         Some(h) => act(
             "last hook",
             format!(
@@ -189,7 +206,7 @@ fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
         ),
         None => act("last hook", st.dim("none yet")),
     }
-    if let Some(h) = &s.last_revoke {
+    if let Some(h) = latest_revoke {
         let reason = h.reason.as_deref().unwrap_or("expired");
         let reason_c = if reason == "bye" {
             st.cyan(reason)

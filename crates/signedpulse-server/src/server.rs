@@ -310,7 +310,6 @@ impl Server {
                             reason: Some("expired".to_string()),
                         };
                         let mut s = status.lock().unwrap();
-                        s.last_revoke = Some(revoke.clone());
                         s.clients.entry(name).or_default().last_revoke = Some(revoke);
                     }
                     Err(err) => error!(ip = %e.ip, error = %err, "revoke hook failed"),
@@ -773,7 +772,6 @@ impl Server {
             };
             let mut s = self.status.lock().unwrap();
             s.verified += 1;
-            s.last_pulse = Some(pulse.clone());
             s.clients.entry(name.clone()).or_default().last_pulse = Some(pulse);
         }
 
@@ -839,7 +837,6 @@ impl Server {
                     reason: Some("grant".to_string()),
                 };
                 let mut s = self.status.lock().unwrap();
-                s.last_hook = Some(hook.clone());
                 s.clients.entry(name.clone()).or_default().last_hook = Some(hook);
                 drop(s);
                 if result.timed_out {
@@ -994,7 +991,6 @@ impl Server {
                     reason: Some("bye".to_string()),
                 };
                 let mut s = self.status.lock().unwrap();
-                s.last_revoke = Some(revoke.clone());
                 s.clients.entry(client_name).or_default().last_revoke = Some(revoke);
             }
             Err(err) => error!(ip = %e.ip, error = %err, "revoke hook failed"),

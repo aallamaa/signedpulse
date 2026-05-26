@@ -63,19 +63,16 @@ pub struct ServerStatusSnapshot {
     pub rejected: u64,
     /// Subset of rejections that were replays.
     pub replays: u64,
-    pub last_pulse: Option<PulseInfo>,
-    pub last_hook: Option<HookInfo>,
-    /// Live access leases currently held (source IPs allowed while pulsing).
+    /// Live access leases currently held (one per pulsing client).
     #[serde(default)]
     pub active_leases: usize,
     /// Detail of each live lease, including how long until it would be revoked.
     #[serde(default)]
     pub leases: Vec<LeaseInfo>,
-    /// Last REVOKE hook run when an access lease expired.
-    #[serde(default)]
-    pub last_revoke: Option<HookInfo>,
     /// Per-client status (last pulse, last grant hook, last revoke), keyed by
-    /// the client's display name (label, else full client_id hex).
+    /// the client's display name (label, else full client_id hex). The most
+    /// recent pulse/hook/revoke *across* clients is derived from this map for the
+    /// `status` summary rather than stored separately.
     pub clients: BTreeMap<String, ClientStatus>,
 }
 
@@ -481,11 +478,6 @@ mod tests {
             verified: 3,
             ..Default::default()
         };
-        snap.last_pulse = Some(PulseInfo {
-            source_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
-            source_port: 5555,
-            at_unix: 1234,
-        });
         snap.clients.insert(
             "client-001".into(),
             ClientStatus {

@@ -380,21 +380,16 @@ async fn status_snapshot_reflects_verified_pulse() {
     fx.server.write_status();
     let snap: ServerStatusSnapshot = status::read_snapshot(&state_path).expect("status file");
     assert!(snap.verified >= 1);
-    let pulse = snap.last_pulse.expect("last_pulse");
+
+    // Pulse + hook are recorded per-client under the label "tester" (there is no
+    // longer a global last_pulse/last_hook; the status summary derives it).
+    let client = snap.clients.get("tester").expect("per-client entry");
+    let pulse = client.last_pulse.as_ref().expect("per-client last_pulse");
     assert_eq!(pulse.source_ip, local.ip());
     assert_eq!(pulse.source_port, local.port());
-    let hook = snap.last_hook.expect("last_hook");
-    assert_eq!(hook.param.as_deref(), Some("hello-world"));
-    assert_eq!(hook.client_id, "tester");
-
-    // The same pulse + hook are recorded per-client under the label "tester".
-    let client = snap.clients.get("tester").expect("per-client entry");
-    assert_eq!(
-        client.last_pulse.as_ref().map(|p| p.source_port),
-        Some(local.port())
-    );
     let chook = client.last_hook.as_ref().expect("per-client last_hook");
     assert_eq!(chook.param.as_deref(), Some("hello-world"));
+    assert_eq!(chook.client_id, "tester");
     assert_eq!(chook.reason.as_deref(), Some("grant"));
     assert!(client.last_revoke.is_none());
 
