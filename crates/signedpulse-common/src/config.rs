@@ -658,6 +658,15 @@ mod tests {
     // Minimal temp-file helper to avoid an extra dev-dependency.
     mod tempfileless {
         use std::path::{Path, PathBuf};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Cargo runs tests as threads within one process, so the PID + a
+        // timestamp is not guaranteed unique: two threads can read the same
+        // nanosecond and collide on the filename, letting one test clobber
+        // another's config file mid-load. A process-wide atomic counter makes
+        // every temp path unique regardless of clock resolution or scheduling.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
         pub struct Temp(pub PathBuf);
         impl Temp {
             pub fn new(contents: &str) -> Self {
@@ -665,10 +674,7 @@ mod tests {
                 let unique = format!(
                     "signedpulse-test-{}-{}.toml",
                     std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos()
+                    COUNTER.fetch_add(1, Ordering::Relaxed)
                 );
                 p.push(unique);
                 std::fs::write(&p, contents).unwrap();
