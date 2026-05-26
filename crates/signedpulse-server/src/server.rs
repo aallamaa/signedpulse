@@ -292,16 +292,18 @@ impl Server {
                         } else {
                             info!(ip = %e.ip, client = %name, exit_code = ?result.exit_code, "lease expired; access revoked");
                         }
-                        let mut s = status.lock().unwrap();
-                        s.last_revoke = Some(HookInfo {
-                            client_id: name,
+                        let revoke = HookInfo {
+                            client_id: name.clone(),
                             source_ip: e.ip,
                             at_unix: now_unix(),
                             exit_code: result.exit_code,
                             timed_out: result.timed_out,
                             param: e.param,
                             reason: Some("expired".to_string()),
-                        });
+                        };
+                        let mut s = status.lock().unwrap();
+                        s.last_revoke = Some(revoke.clone());
+                        s.clients.entry(name).or_default().last_revoke = Some(revoke);
                     }
                     Err(err) => error!(ip = %e.ip, error = %err, "revoke hook failed"),
                 }
@@ -764,7 +766,7 @@ impl Server {
             let mut s = self.status.lock().unwrap();
             s.verified += 1;
             s.last_pulse = Some(pulse.clone());
-            s.clients.insert(name.clone(), pulse);
+            s.clients.entry(name.clone()).or_default().last_pulse = Some(pulse);
         }
 
         // 5. Renew the access lease on EVERY verified pulse — even if the cooldown
@@ -820,7 +822,7 @@ impl Server {
             Ok(result) => {
                 self.cooldown.mark(&id_key);
                 self.cooldown.mark(&ip_key);
-                self.status.lock().unwrap().last_hook = Some(HookInfo {
+                let hook = HookInfo {
                     client_id: name.clone(),
                     source_ip,
                     at_unix: now_unix(),
@@ -828,7 +830,11 @@ impl Server {
                     timed_out: result.timed_out,
                     param,
                     reason: Some("grant".to_string()),
-                });
+                };
+                let mut s = self.status.lock().unwrap();
+                s.last_hook = Some(hook.clone());
+                s.clients.entry(name.clone()).or_default().last_hook = Some(hook);
+                drop(s);
                 if result.timed_out {
                     warn!(%peer, client = %name, "command timed out");
                 } else {
@@ -962,16 +968,18 @@ impl Server {
                 } else {
                     info!(ip = %e.ip, client = %client_name, exit_code = ?result.exit_code, "access revoked (bye)");
                 }
-                let mut s = self.status.lock().unwrap();
-                s.last_revoke = Some(HookInfo {
-                    client_id: client_name,
+                let revoke = HookInfo {
+                    client_id: client_name.clone(),
                     source_ip: e.ip,
                     at_unix: now_unix(),
                     exit_code: result.exit_code,
                     timed_out: result.timed_out,
                     param: revoke_param,
                     reason: Some("bye".to_string()),
-                });
+                };
+                let mut s = self.status.lock().unwrap();
+                s.last_revoke = Some(revoke.clone());
+                s.clients.entry(client_name).or_default().last_revoke = Some(revoke);
             }
             Err(err) => error!(ip = %e.ip, error = %err, "revoke hook failed"),
         }

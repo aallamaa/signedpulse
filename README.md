@@ -526,7 +526,12 @@ Counters
   hello 144 · verified 140 · rejected 4 · replays 0 · leases 3
 
 Clients (3)
-  laptop-1             203.0.113.7:51456     2m ago
+  laptop-1
+    pulse    203.0.113.7:51456 · 2m ago
+    hook     grant · exit 0 · 2m ago
+  phone-2
+    pulse    198.51.100.9:33012 · 5m ago
+    revoke   bye · exit 0 · 40s ago
 
 Leases (revoked when the countdown elapses with no new pulse)
   203.0.113.7          laptop-1         revoke in 12m43s

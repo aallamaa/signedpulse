@@ -74,8 +74,22 @@ pub struct ServerStatusSnapshot {
     /// Last REVOKE hook run when an access lease expired.
     #[serde(default)]
     pub last_revoke: Option<HookInfo>,
-    /// Last verified pulse per client_id.
-    pub clients: BTreeMap<String, PulseInfo>,
+    /// Per-client status (last pulse, last grant hook, last revoke), keyed by
+    /// the client's display name (label, else full client_id hex).
+    pub clients: BTreeMap<String, ClientStatus>,
+}
+
+/// Per-client view: the client's last verified pulse plus the last grant and
+/// revoke hooks attributed to it. (The top-level `last_hook`/`last_revoke` are
+/// the most recent across *all* clients; these are scoped to one client.)
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClientStatus {
+    #[serde(default)]
+    pub last_pulse: Option<PulseInfo>,
+    #[serde(default)]
+    pub last_hook: Option<HookInfo>,
+    #[serde(default)]
+    pub last_revoke: Option<HookInfo>,
 }
 
 /// Point-in-time view of the client, written on demand. A client may pulse
@@ -474,10 +488,14 @@ mod tests {
         });
         snap.clients.insert(
             "client-001".into(),
-            PulseInfo {
-                source_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
-                source_port: 5555,
-                at_unix: 1234,
+            ClientStatus {
+                last_pulse: Some(PulseInfo {
+                    source_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+                    source_port: 5555,
+                    at_unix: 1234,
+                }),
+                last_hook: None,
+                last_revoke: None,
             },
         );
 

@@ -235,13 +235,48 @@ fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
             st.bold("Clients"),
             st.dim(&format!("({})", s.clients.len()))
         );
-        for (id, p) in &s.clients {
-            println!(
-                "  {:<20} {:<22} {}",
-                id,
-                format!("{}:{}", p.source_ip, p.source_port),
-                st.dim(&status::ago(p.at_unix))
-            );
+        for (id, c) in &s.clients {
+            println!("  {}", st.bold(id));
+            let row = |k: &str, v: String| println!("    {}  {}", st.dim(&format!("{k:<7}")), v);
+            if let Some(p) = &c.last_pulse {
+                row(
+                    "pulse",
+                    format!(
+                        "{}:{} · {}",
+                        p.source_ip,
+                        p.source_port,
+                        status::ago(p.at_unix)
+                    ),
+                );
+            }
+            if let Some(h) = &c.last_hook {
+                row(
+                    "hook",
+                    format!(
+                        "{} · {} · {}",
+                        st.green("grant"),
+                        hook_outcome(&st, h),
+                        status::ago(h.at_unix)
+                    ),
+                );
+            }
+            if let Some(h) = &c.last_revoke {
+                let reason = h.reason.as_deref().unwrap_or("expired");
+                let reason_c = if reason == "bye" {
+                    st.cyan(reason)
+                } else {
+                    st.yellow(reason)
+                };
+                row(
+                    "revoke",
+                    format!(
+                        "{} · {} · {}",
+                        reason_c,
+                        hook_outcome(&st, h),
+                        status::ago(h.at_unix)
+                    ),
+                );
+            }
         }
     }
 
