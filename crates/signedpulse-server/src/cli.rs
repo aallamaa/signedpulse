@@ -39,7 +39,15 @@ enum Command {
     /// Install (and start) the server as a background service.
     InstallService(InstallArgs),
     /// Show live status of the running server (local-only).
-    Status,
+    Status(StatusArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct StatusArgs {
+    /// Print the raw live snapshot as JSON (for scripting) instead of the
+    /// colored human-readable view.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -91,129 +99,200 @@ pub async fn run_cli() -> anyhow::Result<()> {
         Some(Command::Init(args)) => init(args, &cli.config),
         Some(Command::AddClient(args)) => add_client(args, &cli.config),
         Some(Command::InstallService(args)) => install_service(args, &cli.config),
-        Some(Command::Status) => status(&cli.config),
+        Some(Command::Status(args)) => status(&cli.config, args.json),
         None => run(&cli.config).await,
     }
 }
 
-fn status(config_path: &Path) -> anyhow::Result<()> {
+fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
     let config = ServerConfig::load(config_path)?;
-
-    let (svc_state, svc_how) =
-        service::query_service("signedpulse-server", "com.signedpulse.server");
-    println!("service:   {} [{svc_how}]", status::service_word(svc_state));
-    println!(
-        "config:    {}  bind={}  server_id={}  clients={}",
-        config_path.display(),
-        config.server.bind,
-        config.server.server_id,
-        config.clients.len()
-    );
-
     let snapshot: Option<ServerStatusSnapshot> =
         status::refresh_and_read_component("server", config.server.state_file.as_deref());
-    match snapshot {
-        None => {
+
+    // Machine-readable: dump the raw live snapshot (or `null`) and stop.
+    if json {
+        match &snapshot {
+            Some(s) => println!("{}", status::to_json_pretty(s)),
+            None => println!("null"),
+        }
+        return Ok(());
+    }
+
+    let st = status::Styler::for_stdout();
+    let (svc_state, svc_how) =
+        service::query_service("signedpulse-server", "com.signedpulse.server");
+
+    println!("{}", st.bold("SignedPulse server"));
+    let kv = |k: &str, v: String| println!("  {}  {}", st.dim(&format!("{k:<11}")), v);
+    kv(
+        "service",
+        format!(
+            "{} {}",
+            status::service_styled(&st, svc_state),
+            st.dim(&format!("[{svc_how}]"))
+        ),
+    );
+    kv("config", config_path.display().to_string());
+    kv(
+        "",
+        st.dim(&format!(
+            "bind {} · server_id {} · clients {}",
+            config.server.bind,
+            config.server.server_id,
+            config.clients.len()
+        )),
+    );
+
+    let Some(s) = snapshot else {
+        println!(
+            "  {}  {}",
+            st.dim(&format!("{:<11}", "status")),
+            st.yellow("no live data (server not running, or could not refresh state file)")
+        );
+        return Ok(());
+    };
+    kv(
+        "pid",
+        format!(
+            "{} · uptime {}",
+            s.pid,
+            status::duration_words(status::now_unix().saturating_sub(s.started_at_unix))
+        ),
+    );
+
+    // ── Activity ──────────────────────────────────────────────
+    println!("\n{}", st.bold("Activity"));
+    let act = |k: &str, v: String| println!("  {}  {}", st.dim(&format!("{k:<12}")), v);
+    match &s.last_pulse {
+        Some(p) => act(
+            "last pulse",
+            format!(
+                "{}:{} · {}",
+                p.source_ip,
+                p.source_port,
+                status::ago(p.at_unix)
+            ),
+        ),
+        None => act("last pulse", st.dim("none yet")),
+    }
+    match &s.last_hook {
+        Some(h) => act(
+            "last hook",
+            format!(
+                "{} \"{}\" → {} · {} · {}",
+                st.green("grant"),
+                h.client_id,
+                h.source_ip,
+                hook_outcome(&st, h),
+                status::ago(h.at_unix)
+            ),
+        ),
+        None => act("last hook", st.dim("none yet")),
+    }
+    if let Some(h) = &s.last_revoke {
+        let reason = h.reason.as_deref().unwrap_or("expired");
+        let reason_c = if reason == "bye" {
+            st.cyan(reason)
+        } else {
+            st.yellow(reason)
+        };
+        act(
+            "last revoke",
+            format!(
+                "{} \"{}\" → {} · {} · {}",
+                reason_c,
+                h.client_id,
+                h.source_ip,
+                hook_outcome(&st, h),
+                status::ago(h.at_unix)
+            ),
+        );
+    }
+
+    // ── Counters ──────────────────────────────────────────────
+    println!("\n{}", st.bold("Counters"));
+    let num = |n: u64, warn: bool| {
+        let s_ = n.to_string();
+        if warn && n > 0 {
+            st.red(&s_)
+        } else {
+            st.dim(&s_)
+        }
+    };
+    println!(
+        "  hello {} · verified {} · rejected {} · replays {} · leases {}",
+        num(s.hello_accepted, false),
+        st.green(&s.verified.to_string()),
+        num(s.rejected, true),
+        num(s.replays, true),
+        num(s.active_leases as u64, false),
+    );
+
+    // ── Clients ───────────────────────────────────────────────
+    if !s.clients.is_empty() {
+        println!(
+            "\n{} {}",
+            st.bold("Clients"),
+            st.dim(&format!("({})", s.clients.len()))
+        );
+        for (id, p) in &s.clients {
             println!(
-                "status:    no live data (server not running, or could not refresh state file)"
+                "  {:<20} {:<22} {}",
+                id,
+                format!("{}:{}", p.source_ip, p.source_port),
+                st.dim(&status::ago(p.at_unix))
             );
         }
-        Some(s) => {
+    }
+
+    // ── Leases ────────────────────────────────────────────────
+    if !s.leases.is_empty() {
+        // Map the lease's canonical hex client_id back to its label.
+        let labels: std::collections::HashMap<&str, &str> = config
+            .clients
+            .iter()
+            .filter_map(|c| c.label.as_deref().map(|l| (c.client_id.as_str(), l)))
+            .collect();
+        println!(
+            "\n{} {}",
+            st.bold("Leases"),
+            st.dim("(revoked when the countdown elapses with no new pulse)")
+        );
+        for l in &s.leases {
+            let who = labels
+                .get(l.client_id.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{}…", &l.client_id[..12.min(l.client_id.len())]));
             println!(
-                "pid:       {}   uptime: {}",
-                s.pid,
-                status::duration_words(status::now_unix().saturating_sub(s.started_at_unix))
+                "  {:<20} {:<16} {}",
+                l.source_ip.to_string(),
+                who,
+                st.dim(&format!(
+                    "revoke in {}",
+                    status::duration_words(l.revoke_in_seconds as i64)
+                ))
             );
-            match &s.last_pulse {
-                Some(p) => println!(
-                    "last pulse: {}:{}  {}",
-                    p.source_ip,
-                    p.source_port,
-                    status::ago(p.at_unix)
-                ),
-                None => println!("last pulse: none yet"),
-            }
-            match &s.last_hook {
-                Some(h) => println!(
-                    "last hook:  \"{}\" -> {}  {}  {}",
-                    h.client_id,
-                    h.source_ip,
-                    if h.timed_out {
-                        "timed out".to_string()
-                    } else {
-                        format!(
-                            "exit {}",
-                            h.exit_code
-                                .map(|c| c.to_string())
-                                .unwrap_or_else(|| "?".into())
-                        )
-                    },
-                    status::ago(h.at_unix)
-                ),
-                None => println!("last hook:  none yet"),
-            }
-            if let Some(h) = &s.last_revoke {
-                println!(
-                    "last revoke: \"{}\" -> {}  {}  {}  {}",
-                    h.client_id,
-                    h.source_ip,
-                    // Why it fired: "bye" (client released) vs "expired" (timed out).
-                    h.reason.as_deref().unwrap_or("expired"),
-                    if h.timed_out {
-                        "timed out".to_string()
-                    } else {
-                        format!(
-                            "exit {}",
-                            h.exit_code
-                                .map(|c| c.to_string())
-                                .unwrap_or_else(|| "?".into())
-                        )
-                    },
-                    status::ago(h.at_unix)
-                );
-            }
-            println!(
-                "counters:  hello={} verified={} rejected={} replays={} leases={}",
-                s.hello_accepted, s.verified, s.rejected, s.replays, s.active_leases
-            );
-            if !s.clients.is_empty() {
-                println!("clients:");
-                for (id, p) in &s.clients {
-                    println!(
-                        "  {:<20} {}:{}  {}",
-                        id,
-                        p.source_ip,
-                        p.source_port,
-                        status::ago(p.at_unix)
-                    );
-                }
-            }
-            if !s.leases.is_empty() {
-                // Map the lease's canonical hex client_id back to its label.
-                let labels: std::collections::HashMap<&str, &str> = config
-                    .clients
-                    .iter()
-                    .filter_map(|c| c.label.as_deref().map(|l| (c.client_id.as_str(), l)))
-                    .collect();
-                println!("leases (revoked when the countdown elapses with no new pulse):");
-                for l in &s.leases {
-                    let who = labels
-                        .get(l.client_id.as_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| {
-                            format!("{}…", &l.client_id[..12.min(l.client_id.len())])
-                        });
-                    println!(
-                        "  {:<20} {}  revoke in {}",
-                        l.source_ip.to_string(),
-                        who,
-                        status::duration_words(l.revoke_in_seconds as i64)
-                    );
-                }
-            }
         }
     }
     Ok(())
+}
+
+/// Colored one-word outcome of a hook run: "exit 0" green, non-zero / timed-out red.
+fn hook_outcome(st: &status::Styler, h: &signedpulse_common::status::HookInfo) -> String {
+    if h.timed_out {
+        st.red("timed out")
+    } else {
+        let code = h
+            .exit_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "?".into());
+        let text = format!("exit {code}");
+        if h.exit_code == Some(0) {
+            st.green(&text)
+        } else {
+            st.red(&text)
+        }
+    }
 }
 
 async fn run(config_path: &Path) -> anyhow::Result<()> {

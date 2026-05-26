@@ -300,12 +300,79 @@ pub fn duration_words(secs: i64) -> String {
     }
 }
 
+/// Serialize a live snapshot to pretty JSON for `status --json`. Falls back to
+/// `"null"` on the (practically impossible) serialization failure.
+pub fn to_json_pretty<T: Serialize>(snapshot: &T) -> String {
+    serde_json::to_string_pretty(snapshot).unwrap_or_else(|_| "null".to_string())
+}
+
+/// Minimal ANSI styler for the human-readable `status` output. Colors are
+/// emitted only when stdout is a real terminal and `NO_COLOR` is unset;
+/// otherwise every method returns its input unchanged, so piped or redirected
+/// output (and `--json`) stays clean and parseable.
+#[derive(Clone, Copy)]
+pub struct Styler {
+    color: bool,
+}
+
+impl Styler {
+    /// Enable colors only on an interactive stdout with `NO_COLOR` unset.
+    pub fn for_stdout() -> Self {
+        use std::io::IsTerminal;
+        let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+        Styler { color }
+    }
+
+    /// A styler that never colors (used for tests / explicit plain output).
+    pub fn plain() -> Self {
+        Styler { color: false }
+    }
+
+    fn wrap(&self, code: &str, s: &str) -> String {
+        if self.color {
+            format!("\x1b[{code}m{s}\x1b[0m")
+        } else {
+            s.to_string()
+        }
+    }
+
+    pub fn bold(&self, s: &str) -> String {
+        self.wrap("1", s)
+    }
+    pub fn dim(&self, s: &str) -> String {
+        self.wrap("2", s)
+    }
+    pub fn red(&self, s: &str) -> String {
+        self.wrap("31", s)
+    }
+    pub fn green(&self, s: &str) -> String {
+        self.wrap("32", s)
+    }
+    pub fn yellow(&self, s: &str) -> String {
+        self.wrap("33", s)
+    }
+    pub fn cyan(&self, s: &str) -> String {
+        self.wrap("36", s)
+    }
+}
+
 /// One-word rendering of a service-manager state.
 pub fn service_word(state: crate::service::ServiceState) -> &'static str {
     match state {
         crate::service::ServiceState::Active => "active (running)",
         crate::service::ServiceState::Inactive => "inactive",
         crate::service::ServiceState::Unknown => "unknown",
+    }
+}
+
+/// `service_word`, colored by state: green active, red inactive, yellow unknown.
+pub fn service_styled(st: &Styler, state: crate::service::ServiceState) -> String {
+    use crate::service::ServiceState;
+    let word = service_word(state);
+    match state {
+        ServiceState::Active => st.green(word),
+        ServiceState::Inactive => st.red(word),
+        ServiceState::Unknown => st.yellow(word),
     }
 }
 
@@ -360,6 +427,24 @@ fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn plain_styler_never_emits_escapes() {
+        let st = Styler::plain();
+        for s in [st.bold("x"), st.red("x"), st.green("x"), st.dim("x")] {
+            assert_eq!(s, "x", "plain styler must pass text through unchanged");
+            assert!(!s.contains('\x1b'));
+        }
+    }
+
+    #[test]
+    fn colored_styler_wraps_in_ansi_then_resets() {
+        // Construct a colored styler directly (for_stdout would see a non-TTY in
+        // the test harness and disable color).
+        let st = Styler { color: true };
+        assert_eq!(st.green("ok"), "\x1b[32mok\x1b[0m");
+        assert_eq!(st.bold("h"), "\x1b[1mh\x1b[0m");
+    }
 
     fn temp(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();

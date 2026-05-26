@@ -45,7 +45,15 @@ enum Command {
     /// Install (and start) this client as a background service.
     InstallService(InstallArgs),
     /// Show live status of the running client (local-only).
-    Status,
+    Status(StatusArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct StatusArgs {
+    /// Print the raw live snapshot as JSON (for scripting) instead of the
+    /// colored human-readable view.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -155,7 +163,7 @@ pub async fn run_cli() -> anyhow::Result<()> {
             Ok(())
         }
         Some(Command::InstallService(args)) => install_service(args, &cli.config),
-        Some(Command::Status) => status(&cli.config),
+        Some(Command::Status(args)) => status(&cli.config, args.json),
         None => {
             init_logging();
             let config = ClientConfig::load(&cli.config)?;
@@ -191,71 +199,121 @@ async fn shutdown_signal() {
     }
 }
 
-fn status(config_path: &std::path::Path) -> anyhow::Result<()> {
+fn status(config_path: &std::path::Path, json: bool) -> anyhow::Result<()> {
     let config = ClientConfig::load(config_path)?;
+    let snapshot: Option<ClientStatusSnapshot> =
+        status::refresh_and_read_component("client", config.client.state_file.as_deref());
 
+    // Machine-readable: dump the raw live snapshot (or `null`) and stop.
+    if json {
+        match &snapshot {
+            Some(s) => println!("{}", status::to_json_pretty(s)),
+            None => println!("null"),
+        }
+        return Ok(());
+    }
+
+    let st = status::Styler::for_stdout();
     let (svc_state, svc_how) =
         service::query_service("signedpulse-client", "com.signedpulse.client");
-    println!(
-        "service:    {} [{svc_how}]",
-        status::service_word(svc_state)
+
+    println!("{}", st.bold("SignedPulse client"));
+    let kv = |k: &str, v: String| println!("  {}  {}", st.dim(&format!("{k:<11}")), v);
+    kv(
+        "service",
+        format!(
+            "{} {}",
+            status::service_styled(&st, svc_state),
+            st.dim(&format!("[{svc_how}]"))
+        ),
     );
+    kv("config", config_path.display().to_string());
     let extra = config.client.servers.len();
-    let server_summary = if extra > 0 {
+    let servers_note = if extra > 0 {
         format!("{} (+{extra} more)", config.client.server_addr)
     } else {
         config.client.server_addr.clone()
     };
-    println!(
-        "config:     {}  client_id={}  server={}",
-        config_path.display(),
-        config.client.client_id,
-        server_summary
+    kv(
+        "",
+        st.dim(&format!(
+            "client_id {} · server {}",
+            config.client.client_id, servers_note
+        )),
     );
 
-    let snapshot: Option<ClientStatusSnapshot> =
-        status::refresh_and_read_component("client", config.client.state_file.as_deref());
-    match snapshot {
-        None => {
-            println!(
-                "status:     no live data (client not running, or could not refresh state file)"
-            );
+    let Some(s) = snapshot else {
+        println!(
+            "  {}  {}",
+            st.dim(&format!("{:<11}", "status")),
+            st.yellow("no live data (client not running, or could not refresh state file)")
+        );
+        return Ok(());
+    };
+    kv(
+        "pid",
+        format!(
+            "{} · uptime {}",
+            s.pid,
+            status::duration_words(status::now_unix().saturating_sub(s.started_at_unix))
+        ),
+    );
+
+    // One section per server the client pulses, keyed by its local label.
+    println!(
+        "\n{} {}",
+        st.bold("Servers"),
+        st.dim(&format!("({})", s.servers.len()))
+    );
+    for (name, leg) in &s.servers {
+        let header = if !leg.server_id.is_empty() && leg.server_id != *name {
+            format!(
+                "{} {}",
+                st.bold(name),
+                st.dim(&format!(
+                    "(server_id {}, {})",
+                    leg.server_id, leg.server_addr
+                ))
+            )
+        } else {
+            format!(
+                "{} {}",
+                st.bold(name),
+                st.dim(&format!("({})", leg.server_addr))
+            )
+        };
+        println!("  {header}");
+        let row = |k: &str, v: String| println!("    {}  {}", st.dim(&format!("{k:<11}")), v);
+        match leg.last_success_at_unix {
+            Some(t) => row(
+                "last pulse",
+                format!("{} · {}", st.green("OK"), status::ago(t)),
+            ),
+            None => row("last pulse", st.dim("none succeeded yet")),
         }
-        Some(s) => {
-            println!(
-                "pid:        {}   uptime: {}",
-                s.pid,
-                status::duration_words(status::now_unix().saturating_sub(s.started_at_unix))
-            );
-            // One block per server the client pulses, keyed by its local label.
-            for (name, leg) in &s.servers {
-                if !leg.server_id.is_empty() && leg.server_id != *name {
-                    println!(
-                        "server {name} (server_id={}, {}):",
-                        leg.server_id, leg.server_addr
-                    );
-                } else {
-                    println!("server {name} ({}):", leg.server_addr);
-                }
-                match leg.last_success_at_unix {
-                    Some(t) => println!("  last pulse: OK  {}", status::ago(t)),
-                    None => println!("  last pulse: none succeeded yet"),
-                }
-                // Next pulse ≈ last attempt + interval.
-                if let Some(attempt) = leg.last_attempt_at_unix {
-                    let next_in = (attempt as i128 + leg.interval_seconds as i128
-                        - status::now_unix() as i128)
-                        .clamp(i64::MIN as i128, i64::MAX as i128)
-                        as i64;
-                    if next_in > 0 {
-                        println!("  next pulse: in ~{}", status::duration_words(next_in));
-                    } else {
-                        println!("  next pulse: due now");
-                    }
-                }
-                println!("  last result: {}", leg.last_result);
+        // Next pulse ≈ last attempt + interval.
+        if let Some(attempt) = leg.last_attempt_at_unix {
+            let next_in = (attempt as i128 + leg.interval_seconds as i128
+                - status::now_unix() as i128)
+                .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+            if next_in > 0 {
+                row(
+                    "next pulse",
+                    format!("in ~{}", status::duration_words(next_in)),
+                );
+            } else {
+                row("next pulse", st.yellow("due now"));
             }
         }
+        // "ok" green, anything else (an error string) red.
+        let result = if leg.last_result == "ok" {
+            st.green(&leg.last_result)
+        } else if leg.last_result == "pending" {
+            st.dim(&leg.last_result)
+        } else {
+            st.red(&leg.last_result)
+        };
+        row("last result", result);
     }
     Ok(())
 }

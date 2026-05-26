@@ -505,28 +505,52 @@ signedpulse-server status
 signedpulse-client status
 ```
 
-Example output:
+Example output (the terminal view is colorized — green for healthy, red for
+errors, yellow for warnings; color is auto-disabled when piped or when
+`NO_COLOR` is set):
 
 ```
 $ signedpulse-server status
-service:   active (running) [systemctl]
-config:    /etc/signedpulse/server.toml  bind=0.0.0.0:7370  server_id=signedpulse-main  clients=3
-pid:       4821   uptime: 2h13m
-last pulse: 203.0.113.7:51456  2m ago
-last hook:  "laptop-1" -> 203.0.113.7  exit 0  2m ago
-last revoke: "phone-2" -> 198.51.100.9  bye  exit 0  40s ago
-counters:  hello=144 verified=140 rejected=4 replays=0 leases=3
-clients:
-  laptop-1             203.0.113.7:51456  2m ago
-leases (revoked when the countdown elapses with no new pulse):
-  203.0.113.7          laptop-1  revoke in 12m43s
+SignedPulse server
+  service      active (running) [systemctl]
+  config       /etc/signedpulse/server.toml
+               bind 0.0.0.0:7370 · server_id signedpulse-main · clients 3
+  pid          4821 · uptime 2h13m
+
+Activity
+  last pulse    203.0.113.7:51456 · 2m ago
+  last hook     grant "laptop-1" → 203.0.113.7 · exit 0 · 2m ago
+  last revoke   bye "phone-2" → 198.51.100.9 · exit 0 · 40s ago
+
+Counters
+  hello 144 · verified 140 · rejected 4 · replays 0 · leases 3
+
+Clients (3)
+  laptop-1             203.0.113.7:51456     2m ago
+
+Leases (revoked when the countdown elapses with no new pulse)
+  203.0.113.7          laptop-1         revoke in 12m43s
 
 $ signedpulse-client status
-service:    active (running) [systemctl]
-config:     /etc/signedpulse/client.toml  client_id=9819…f8  server=203.0.113.10:7370
-last pulse: OK  43s ago
-next pulse: in ~4m17s
-last result: ok
+SignedPulse client
+  service      active (running) [systemctl]
+  config       /etc/signedpulse/client.toml
+               client_id 9819…f8 · server 203.0.113.10:7370
+  pid          5120 · uptime 1h02m
+
+Servers (1)
+  main (203.0.113.10:7370)
+    last pulse   OK · 43s ago
+    next pulse   in ~4m17s
+    last result  ok
+```
+
+For scripting, `status --json` prints the raw live snapshot instead of the
+human view (or `null` when the daemon isn't running):
+
+```
+$ signedpulse-server status --json | jq .verified
+140
 ```
 
 **How it works (and why it's safe).** `status` is **local-only** — it never
