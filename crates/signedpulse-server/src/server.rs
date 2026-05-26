@@ -132,10 +132,10 @@ impl Server {
             let verifying_key = crypto::load_verifying_key(&c.public_key).map_err(|e| {
                 anyhow::anyhow!("client {:?} has an invalid public_key: {e}", c.client_id)
             })?;
-            let name = c
-                .label
-                .clone()
-                .unwrap_or_else(|| format!("{}…", &c.client_id[..12.min(c.client_id.len())]));
+            // Display name: the label if set, otherwise the full client_id (not
+            // truncated — the full value shows in logs and `status` output,
+            // including `--json`).
+            let name = c.label.clone().unwrap_or_else(|| c.client_id.clone());
             clients.insert(
                 id,
                 ClientInfo {

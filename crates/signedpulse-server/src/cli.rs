@@ -262,7 +262,7 @@ fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
             let who = labels
                 .get(l.client_id.as_str())
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("{}…", &l.client_id[..12.min(l.client_id.len())]));
+                .unwrap_or_else(|| l.client_id.clone());
             println!(
                 "  {:<20} {:<16} {}",
                 l.source_ip.to_string(),
