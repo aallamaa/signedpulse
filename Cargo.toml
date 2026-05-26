@@ -18,7 +18,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 rust-version = "1.85"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -31,9 +31,9 @@ readme = "README.md"
 [workspace.dependencies]
 # Internal crates carry a version (alongside the path) so they resolve from
 # crates.io once published — `cargo publish` drops the path automatically.
-signedpulse-common = { path = "crates/signedpulse-common", version = "0.3.1" }
-signedpulse-server = { path = "crates/signedpulse-server", version = "0.3.1" }
-signedpulse-client = { path = "crates/signedpulse-client", version = "0.3.1" }
+signedpulse-common = { path = "crates/signedpulse-common", version = "0.3.2" }
+signedpulse-server = { path = "crates/signedpulse-server", version = "0.3.2" }
+signedpulse-client = { path = "crates/signedpulse-client", version = "0.3.2" }
 
 tokio = { version = "1", features = [
     "rt-multi-thread",

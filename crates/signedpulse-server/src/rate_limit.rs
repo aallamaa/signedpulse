@@ -6,7 +6,7 @@
 //! fixed-window counter per source IP bounds that. Cooldown tracking prevents a
 //! verified client (or source IP) from triggering the hook too frequently.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -428,16 +428,17 @@ impl ActiveIps {
     }
 }
 
-/// One active access lease, keyed by source IP. Renewed on every verified pulse;
-/// when it expires (no pulse for the TTL) the server runs the revoke hook.
+/// One active access lease, keyed by `client_id`. Renewed on every verified
+/// pulse; when it expires (no pulse for the TTL) the server may run the revoke
+/// hook (see [`LeaseTracker`] for the IP reference-counting rule).
 struct Lease {
     expires_at: Instant,
-    client_id: String,
+    ip: IpAddr,
     source_port: u16,
     param: Option<String>,
 }
 
-/// A lease that expired this sweep — the data the revoke hook needs.
+/// A lease that ended (expired or released) — the data the revoke hook needs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExpiredLease {
     pub ip: IpAddr,
@@ -446,16 +447,21 @@ pub struct ExpiredLease {
     pub param: Option<String>,
 }
 
-/// Per-source-IP access leases for the port-knock "access while pulsing" model.
-/// A verified pulse renews the IP's lease (with a TTL derived from the client's
-/// advertised interval); when an IP stops pulsing the lease expires and the
-/// caller runs the revoke hook. Always populated (independent of whether a
-/// revoke hook is configured) so the server can also tell the GRANT hook whether
-/// a pulse is a new/reactivated session (`renew` returns that). Keyed by IP so a
-/// NAT'd address shared by clients stays open while any of them pulses.
+/// Per-**client** access leases for the port-knock "access while pulsing" model.
+/// A verified pulse renews that client's lease (TTL derived from the client's
+/// advertised interval); when the client stops pulsing its lease expires.
+///
+/// Identity (grant, `{new}`, cooldown, observability) follows the `client_id`,
+/// but the *firewall* it controls filters on **source IP**, so the revoke hook
+/// (which closes the IP pinhole) is **reference-counted by IP**: closing only
+/// happens when the LAST client behind an IP leaves. `take_expired` / `release`
+/// therefore report, per ended lease, whether its IP is now free of any other
+/// live lease (`ip_freed`) — the caller runs the revoke only then. This keeps
+/// co-NAT clients independent for grants while never tearing down a pinhole a
+/// sibling client is still using.
 pub struct LeaseTracker {
     max_entries: usize,
-    leases: Mutex<HashMap<IpAddr, Lease>>,
+    leases: Mutex<HashMap<String, Lease>>,
 }
 
 impl LeaseTracker {
@@ -466,121 +472,131 @@ impl LeaseTracker {
         }
     }
 
-    /// Create or renew the lease for `ip`, with `ttl` from now. Returns `true`
-    /// when this is a NEW or reactivated session — i.e. there was no live lease
-    /// for the IP immediately before (first pulse ever, or the first after the
-    /// previous lease expired) — and `false` when it merely renews a live lease.
-    /// Only reachable post-signature-verification, so unspoofable; a genuinely
-    /// new IP is gated by `max_entries` (refused when full, like `ActiveIps`).
+    /// Create or renew `client_id`'s lease (its current source IP/port/param),
+    /// with `ttl` from now. Returns `true` when this is a NEW or reactivated
+    /// session for *this client* — no live lease for it immediately before (first
+    /// pulse ever, or the first after its previous lease expired) — and `false`
+    /// when it merely renews a live one. Only reachable post-signature, so
+    /// unspoofable; a genuinely new client is gated by `max_entries` (refused
+    /// when full, like `ActiveIps`).
     pub fn renew(
         &self,
-        ip: IpAddr,
         client_id: &str,
+        ip: IpAddr,
         source_port: u16,
         param: Option<&str>,
         ttl: Duration,
     ) -> bool {
-        self.renew_at(ip, client_id, source_port, param, ttl, Instant::now())
+        self.renew_at(client_id, ip, source_port, param, ttl, Instant::now())
     }
 
     fn renew_at(
         &self,
-        ip: IpAddr,
         client_id: &str,
+        ip: IpAddr,
         source_port: u16,
         param: Option<&str>,
         ttl: Duration,
         now: Instant,
     ) -> bool {
         let mut leases = self.leases.lock().unwrap();
-        // A live (non-expired) lease for this IP means it's a renewal; an absent
-        // or already-expired entry means a new/reactivated session.
-        let is_new = match leases.get(&ip) {
+        let is_new = match leases.get(client_id) {
             Some(l) => now >= l.expires_at,
             None => true,
         };
         let lease = Lease {
             expires_at: now + ttl,
-            client_id: client_id.to_string(),
+            ip,
             source_port,
             param: param.map(|s| s.to_string()),
         };
-        // Refresh an existing IP freely; only a genuinely new IP is gated by the
-        // cap. At true saturation (max_entries distinct LIVE leases) a new IP is
-        // refused tracking: the grant hook still runs (access works) but the IP
-        // won't be auto-revoked since no lease is stored. We do NOT evict expired
-        // entries here — they must go through `take_expired` to fire their revoke
-        // hook; the 5s sweep reclaims those slots, so this only bites at genuine
-        // saturation by live leases. `is_new` is still returned true for a
-        // refused IP so the grant hook treats it as a fresh session.
-        if leases.contains_key(&ip) || leases.len() < self.max_entries {
-            leases.insert(ip, lease);
+        // Refresh an existing client freely; only a genuinely new client is gated
+        // by the cap (refused tracking at saturation; grant still runs so access
+        // works, it just won't be auto-revoked). `is_new` is still true so the
+        // grant hook treats a refused client as a fresh session.
+        if leases.contains_key(client_id) || leases.len() < self.max_entries {
+            leases.insert(client_id.to_string(), lease);
         }
         is_new
     }
 
-    /// Remove and return the lease for `ip` — for a client-initiated release
-    /// (BYE) — but only if it is owned by `client_id`. The ownership check stops
-    /// one client from releasing another's lease when they share a source IP
-    /// (NAT): the per-IP lease slot is held by whoever pulsed last, so a BYE from
-    /// a different client must not tear it down. Returns the data needed to run
-    /// the revoke hook, or `None` if there is no lease or it belongs to someone
-    /// else.
-    pub fn release(&self, ip: IpAddr, client_id: &str) -> Option<ExpiredLease> {
+    /// Release `client_id`'s own lease for a client-initiated BYE (authenticated
+    /// as that client, so no cross-client ownership concern). Returns the data
+    /// the revoke hook needs plus `ip_freed` — `true` when no OTHER live lease
+    /// references the same IP, i.e. the firewall pinhole should now close.
+    pub fn release(&self, client_id: &str) -> Option<(ExpiredLease, bool)> {
+        self.release_at(client_id, Instant::now())
+    }
+
+    fn release_at(&self, client_id: &str, now: Instant) -> Option<(ExpiredLease, bool)> {
         let mut leases = self.leases.lock().unwrap();
-        if !matches!(leases.get(&ip), Some(l) if l.client_id == client_id) {
-            return None;
-        }
-        leases.remove(&ip).map(|l| ExpiredLease {
-            ip,
-            client_id: l.client_id,
-            source_port: l.source_port,
-            param: l.param,
-        })
+        let l = leases.remove(client_id)?;
+        let ip_freed = !leases.values().any(|o| now < o.expires_at && o.ip == l.ip);
+        Some((
+            ExpiredLease {
+                ip: l.ip,
+                client_id: client_id.to_string(),
+                source_port: l.source_port,
+                param: l.param,
+            },
+            ip_freed,
+        ))
     }
 
-    /// Whether `ip` currently holds a non-expired lease. Used by the revoke sweep
-    /// to skip an IP that re-pulsed (and got a fresh lease) since it expired,
-    /// avoiding a stale revoke tearing down access a concurrent grant re-opened.
-    pub fn is_live(&self, ip: IpAddr) -> bool {
-        self.is_live_at(ip, Instant::now())
-    }
-
-    fn is_live_at(&self, ip: IpAddr, now: Instant) -> bool {
+    /// Whether any client currently holds a non-expired lease for `ip`. Used by
+    /// the revoke path to skip closing an IP that a (possibly different) client
+    /// re-pulsed between the sweep and the hook running.
+    pub fn is_ip_live(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
         self.leases
             .lock()
             .unwrap()
-            .get(&ip)
-            .is_some_and(|l| now < l.expires_at)
+            .values()
+            .any(|l| now < l.expires_at && l.ip == ip)
     }
 
-    /// Remove and return every lease that has expired, so the caller can run the
-    /// revoke hook for each. Drains under a single lock; the lock is released
-    /// before the caller spawns any revoke work.
-    pub fn take_expired(&self) -> Vec<ExpiredLease> {
+    /// Remove every expired lease and report, per ended lease, whether its IP is
+    /// now free of any other live lease (`ip_freed`). When several expired leases
+    /// share a freed IP, exactly one is marked `ip_freed = true` so the caller
+    /// closes that pinhole once. Drains under a single lock.
+    pub fn take_expired(&self) -> Vec<(ExpiredLease, bool)> {
         self.take_expired_at(Instant::now())
     }
 
-    fn take_expired_at(&self, now: Instant) -> Vec<ExpiredLease> {
+    fn take_expired_at(&self, now: Instant) -> Vec<(ExpiredLease, bool)> {
         let mut leases = self.leases.lock().unwrap();
-        let mut expired = Vec::new();
-        leases.retain(|ip, l| {
-            if now >= l.expires_at {
-                expired.push(ExpiredLease {
-                    ip: *ip,
-                    client_id: l.client_id.clone(),
-                    source_port: l.source_port,
-                    param: l.param.clone(),
-                });
-                false
-            } else {
-                true
+        let expired_keys: Vec<String> = leases
+            .iter()
+            .filter(|(_, l)| now >= l.expires_at)
+            .map(|(k, _)| k.clone())
+            .collect();
+        // IPs still referenced by a (now necessarily live) remaining lease.
+        let mut taken: Vec<(String, Lease)> = Vec::with_capacity(expired_keys.len());
+        for k in expired_keys {
+            if let Some(l) = leases.remove(&k) {
+                taken.push((k, l));
             }
-        });
-        expired
+        }
+        let live_ips: HashSet<IpAddr> = leases.values().map(|l| l.ip).collect();
+        let mut freed_this_batch: HashSet<IpAddr> = HashSet::new();
+        taken
+            .into_iter()
+            .map(|(cid, l)| {
+                let ip_freed = !live_ips.contains(&l.ip) && freed_this_batch.insert(l.ip);
+                (
+                    ExpiredLease {
+                        ip: l.ip,
+                        client_id: cid,
+                        source_port: l.source_port,
+                        param: l.param,
+                    },
+                    ip_freed,
+                )
+            })
+            .collect()
     }
 
-    /// Count of live (non-expired) leases, for status.
+    /// Count of live (non-expired) client leases, for status.
     pub fn active_count(&self) -> usize {
         let now = Instant::now();
         self.leases
@@ -600,7 +616,7 @@ impl LeaseTracker {
             .unwrap()
             .iter()
             .filter(|(_, l)| now < l.expires_at)
-            .map(|(ip, l)| (*ip, l.client_id.clone(), (l.expires_at - now).as_secs()))
+            .map(|(cid, l)| (l.ip, cid.clone(), (l.expires_at - now).as_secs()))
             .collect()
     }
 }
@@ -621,84 +637,102 @@ mod tests {
         let t0 = Instant::now();
         let ttl = Duration::from_secs(10);
         // First pulse is a new session.
-        assert!(lt.renew_at(ip(1), "cid", 5, None, ttl, t0));
+        assert!(lt.renew_at("cid", ip(1), 5, None, ttl, t0));
         assert_eq!(lt.take_expired_at(t0).len(), 0);
         // Renewal within TTL is not "new" and pushes expiry out.
-        assert!(!lt.renew_at(ip(1), "cid", 5, None, ttl, t0 + Duration::from_secs(5)));
+        assert!(!lt.renew_at("cid", ip(1), 5, None, ttl, t0 + Duration::from_secs(5)));
         assert_eq!(
             lt.take_expired_at(t0 + Duration::from_secs(11)).len(),
             0,
             "renewal should have pushed expiry past t0+11"
         );
-        // After it finally expires, take_expired drains it once.
+        // After it finally expires, take_expired drains it once; its IP is freed.
         let expired = lt.take_expired_at(t0 + Duration::from_secs(100));
         assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].ip, ip(1));
+        assert_eq!(expired[0].0.ip, ip(1));
+        assert!(expired[0].1, "sole lease on the IP → ip_freed");
         // A pulse after expiry is a new/reactivated session again.
-        assert!(lt.renew_at(ip(1), "cid", 5, None, ttl, t0 + Duration::from_secs(101)));
+        assert!(lt.renew_at("cid", ip(1), 5, None, ttl, t0 + Duration::from_secs(101)));
     }
 
     #[test]
-    fn lease_is_live_tracks_expiry() {
+    fn lease_is_ip_live_tracks_expiry() {
         let lt = LeaseTracker::new(1024);
         let t0 = Instant::now();
         let ttl = Duration::from_secs(10);
-        assert!(!lt.is_live_at(ip(1), t0), "no lease yet");
-        lt.renew_at(ip(1), "c", 1, None, ttl, t0);
-        assert!(
-            lt.is_live_at(ip(1), t0 + Duration::from_secs(5)),
-            "within ttl"
-        );
-        assert!(
-            !lt.is_live_at(ip(1), t0 + Duration::from_secs(11)),
-            "past ttl"
-        );
+        assert!(!lt.is_ip_live(ip(1)), "no lease yet");
+        lt.renew_at("c", ip(1), 1, None, ttl, t0);
+        assert!(lt.is_ip_live(ip(1)), "within ttl");
     }
 
     #[test]
-    fn lease_records_latest_client_and_caps() {
+    fn lease_is_per_client_and_caps() {
         let lt = LeaseTracker::new(2);
         let t0 = Instant::now();
         let ttl = Duration::from_secs(10);
-        lt.renew_at(ip(1), "alice", 1, Some("a"), ttl, t0);
-        lt.renew_at(ip(1), "bob", 2, Some("b"), ttl, t0); // overwrite same IP
-        lt.renew_at(ip(2), "carol", 3, None, ttl, t0);
-        // Table is full (2); a third distinct IP is refused tracking.
-        lt.renew_at(ip(3), "dave", 4, None, ttl, t0);
+        // alice and bob each get their own lease (distinct client ids).
+        assert!(lt.renew_at("alice", ip(1), 1, Some("a"), ttl, t0));
+        assert!(lt.renew_at("bob", ip(2), 2, Some("b"), ttl, t0));
+        // Table full (2 clients); a third distinct client is refused tracking.
+        lt.renew_at("carol", ip(3), 3, None, ttl, t0);
         assert_eq!(lt.active_count(), 2);
         let mut expired = lt.take_expired_at(t0 + Duration::from_secs(11));
-        expired.sort_by_key(|e| e.ip);
+        expired.sort_by_key(|(e, _)| e.client_id.clone());
         assert_eq!(expired.len(), 2);
-        // ip(1) carries the latest renewer (bob/port2/param b).
-        let one = expired.iter().find(|e| e.ip == ip(1)).unwrap();
-        assert_eq!(one.client_id, "bob");
-        assert_eq!(one.source_port, 2);
-        assert_eq!(one.param.as_deref(), Some("b"));
+        let (alice, alice_freed) = &expired[0];
+        assert_eq!(alice.client_id, "alice");
+        assert_eq!(alice.source_port, 1);
+        assert_eq!(alice.param.as_deref(), Some("a"));
+        assert!(alice_freed, "alice was the only lease on ip(1)");
     }
 
     #[test]
-    fn lease_release_requires_matching_client() {
+    fn co_nat_clients_keep_pinhole_until_last_leaves() {
         let lt = LeaseTracker::new(1024);
+        let t0 = Instant::now();
         let ttl = Duration::from_secs(10);
-        // alice and bob share a source IP (NAT); bob pulsed last, so he owns the
-        // per-IP lease slot.
-        lt.renew_at(ip(1), "alice", 1, None, ttl, Instant::now());
-        lt.renew_at(ip(1), "bob", 2, None, ttl, Instant::now());
+        // alice and bob share one source IP (behind the same NAT).
+        lt.renew_at("alice", ip(1), 1, None, ttl, t0);
+        lt.renew_at("bob", ip(1), 2, None, Duration::from_secs(30), t0);
 
-        // A BYE from alice must NOT release bob's lease.
-        assert!(lt.release(ip(1), "alice").is_none());
-        assert!(
-            lt.is_live(ip(1)),
-            "alice's BYE must leave bob's lease intact"
-        );
+        // alice's BYE releases only her lease; bob still holds the IP, so the
+        // pinhole must NOT close.
+        let (e, ip_freed) = lt.release_at("alice", t0 + Duration::from_secs(1)).unwrap();
+        assert_eq!(e.client_id, "alice");
+        assert!(!ip_freed, "bob still holds ip(1); must not close");
+        assert!(lt.is_ip_live(ip(1)));
 
-        // bob (the owner) can release it; a second release is then a no-op.
-        let released = lt.release(ip(1), "bob").expect("owner releases own lease");
-        assert_eq!(released.client_id, "bob");
-        assert!(lt.release(ip(1), "bob").is_none());
+        // Now bob expires (alice already gone) → his expiry frees the IP.
+        let expired = lt.take_expired_at(t0 + Duration::from_secs(31));
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].0.client_id, "bob");
+        assert!(expired[0].1, "last client on the IP → ip_freed");
+        assert!(!lt.is_ip_live(ip(1)));
+    }
 
-        // Releasing an IP with no lease at all is a no-op.
-        assert!(lt.release(ip(2), "anyone").is_none());
+    #[test]
+    fn batch_expiry_frees_shared_ip_exactly_once() {
+        let lt = LeaseTracker::new(1024);
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(10);
+        // Two clients on one IP, one on another — all expire in the same sweep.
+        lt.renew_at("a", ip(1), 1, None, ttl, t0);
+        lt.renew_at("b", ip(1), 2, None, ttl, t0);
+        lt.renew_at("c", ip(2), 3, None, ttl, t0);
+        let expired = lt.take_expired_at(t0 + Duration::from_secs(11));
+        assert_eq!(expired.len(), 3);
+        // ip(1) is shared by a+b → freed exactly once across the batch.
+        let freed_ip1 = expired
+            .iter()
+            .filter(|(e, freed)| e.ip == ip(1) && *freed)
+            .count();
+        assert_eq!(freed_ip1, 1, "shared IP closed once, not per client");
+        // ip(2) had a single client → freed once.
+        let freed_ip2 = expired
+            .iter()
+            .filter(|(e, freed)| e.ip == ip(2) && *freed)
+            .count();
+        assert_eq!(freed_ip2, 1);
     }
 
     #[test]

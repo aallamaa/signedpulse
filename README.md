@@ -52,9 +52,10 @@ allow-list — see `examples/signedpulse-hook.sh`).
 ### Access while pulsing (leases)
 
 Rather than leaving the pinhole open forever, let SignedPulse close it for you.
-Set a **revoke hook** and the server tracks a per-IP *lease*: each verified pulse
-runs the grant hook (`command.argv`) and renews the lease; when an IP stops
-pulsing, the server runs `command.revoke_argv` to close it.
+Set a **revoke hook** and the server tracks a *lease* **per client**: each
+verified pulse runs the grant hook (`command.argv`) and renews that client's
+lease; when a client stops pulsing, the server runs `command.revoke_argv` to
+close it.
 
 ```toml
 # server.toml
@@ -79,7 +80,17 @@ released it explicitly on shutdown — see below). The grant hook receives
 `reason=grant`. Use it to branch, e.g. `revoke … "{reason}"` then in the hook
 `case "$reason" in bye) … ;; expired) … ;; esac`.
 
-Make both hooks **idempotent**: the grant runs on every pulse, and because
+**Shared NAT.** Leases, cooldown, `{new}`, and per-client status all key on the
+authenticated **`client_id`**, so two clients behind one public IP are tracked
+independently — each gets its own grant and its own throttling. But the firewall
+filters on **source IP**, so the *revoke* (the pinhole close) is
+**reference-counted by IP**: when a client's lease ends, the revoke hook runs
+only if no other client behind that IP still holds a live lease. A co-NAT
+sibling that's still pulsing keeps the pinhole open — one client going silent
+never tears down another's access.
+
+Make both hooks **idempotent**: the grant runs on every pulse (and, behind a
+shared NAT, once per client → repeated `nft add` of the same IP), and because
 leases live in memory a server restart forgets them (a grant may recur and a
 revoke may be skipped until the client pulses again). See
 `examples/signedpulse-hook.sh` for a complete grant/revoke nftables hook.

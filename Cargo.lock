@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "signedpulse"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "signedpulse-client",
@@ -695,7 +695,7 @@ dependencies = [
 
 [[package]]
 name = "signedpulse-client"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -710,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "signedpulse-common"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "signedpulse-server"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "clap",
